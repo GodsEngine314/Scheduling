@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scheduling schema ERD — planned shifts vs. actual worked shifts</title>
+<style>
+  :root{
+    --surface-0:#faf9f7; --surface-1:#ffffff;
+    --text-primary:#1c1c1a; --text-secondary:#5f5e5a; --text-muted:#888780;
+    --border:#ddd9d0; --border-strong:#b4b2a9; --bg-accent:#f3f1fb;
+    --font-sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+    --font-mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --plan-fill:#EEEDFE; --plan-text:#26215C; --plan-border:#AFA9EC;
+    --act-fill:#E1F5EE;  --act-text:#04342C;  --act-border:#5DCAA5;
+    --req-fill:#FAECE7;  --req-text:#4A1B0C;  --req-border:#F0997B;
+    --gray-fill:#F1EFE8; --gray-text:#2C2C2A;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --surface-0:#1a1a19; --surface-1:#232322;
+      --text-primary:#eceae4; --text-secondary:#b4b2a9; --text-muted:#888780;
+      --border:#3a3a38; --border-strong:#5f5e5a; --bg-accent:#2b2745;
+      --plan-fill:#3C3489; --plan-text:#CECBF6; --plan-border:#7F77DD;
+      --act-fill:#085041;  --act-text:#9FE1CB;  --act-border:#1D9E75;
+      --req-fill:#712B13;  --req-text:#F5C4B3;  --req-border:#D85A30;
+      --gray-fill:#444441; --gray-text:#D3D1C7;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:24px;background:var(--surface-0);color:var(--text-primary);font-family:var(--font-sans)}
+  h1{font-size:16px;margin:0 0 4px}
+  .sub{font-size:12px;color:var(--text-secondary);margin:0 0 16px;max-width:940px;line-height:1.55}
+  .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+  .erd-wrap{overflow-x:auto;padding:8px 0}
+  .erd-canvas{position:relative;width:1090px;height:1040px}
+  .erd-lines{position:absolute;inset:0}
+  .erd-lines .v{fill:var(--text-secondary);font-family:var(--font-sans);font-size:10px;font-style:italic}
+  .erd-lines .c{fill:var(--text-muted);font-family:var(--font-mono);font-size:9px}
+  .erd-lines .v-key{fill:#1D9E75;font-weight:600;font-style:normal}
+  .ent{position:absolute;border:1px solid var(--border);border-radius:6px;background:var(--surface-1);overflow:hidden}
+  .ent.proj{border-style:dashed;border-color:var(--border-strong);background:var(--surface-0)}
+  .ent-h{height:26px;line-height:24px;padding:0 8px;border-bottom:1px solid var(--border);font-size:10.5px;font-weight:700;display:flex;justify-content:space-between;align-items:center;gap:6px}
+  .ent-tag{font-size:8px;font-weight:600;letter-spacing:.04em;opacity:.8;white-space:nowrap;font-family:var(--font-mono)}
+  .ent-b{padding:3px 8px}
+  .r{height:15px;line-height:15px;display:flex;align-items:center;gap:6px;font-family:var(--font-mono);font-size:10px;white-space:nowrap}
+  .r .n{flex:1;overflow:hidden;text-overflow:ellipsis}
+  .r .k{font-size:8px;font-weight:700;color:var(--text-secondary);min-width:20px;text-align:right}
+  .r .t{color:var(--text-muted);font-size:9px;min-width:50px;text-align:right}
+  .r.pk .n{font-weight:700}
+  .r.hl{background:var(--bg-accent);margin:0 -8px;padding:0 8px}
+  .e-plan{border-color:var(--plan-border)} .e-plan .ent-h{background:var(--plan-fill);color:var(--plan-text)}
+  .e-act{border-color:var(--act-border)}   .e-act .ent-h{background:var(--act-fill);color:var(--act-text)}
+  .e-req{border-color:var(--req-border)}   .e-req .ent-h{background:var(--req-fill);color:var(--req-text)}
+  .e-gray .ent-h{background:var(--gray-fill);color:var(--gray-text)}
+  .note{position:absolute;font-size:9.5px;font-style:italic;color:var(--text-muted);line-height:1.35}
+  .note code,.legend code,footer code{font-family:var(--font-mono);font-size:9.5px;color:var(--text-secondary)}
+  .legend{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;font-size:11px;color:var(--text-secondary);padding-top:8px}
+  .legend b{display:inline-flex;align-items:center;gap:5px;font-weight:500}
+  .sw{width:10px;height:10px;border-radius:3px;display:inline-block}
+  .swb{width:14px;border-top:2px dashed var(--border-strong);display:inline-block}
+  .sws{width:14px;border-top:2px solid var(--text-secondary);display:inline-block}
+  footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text-muted);max-width:940px;line-height:1.6}
+  footer p{margin:0 0 10px}
+</style>
+</head>
+<body>
+
+<h1>Scheduling schema — planned shifts vs. actual worked shifts</h1>
+<p class="sub">
+  Border style carries the ownership rule. <strong>Dashed</strong> tables are projections, rebuilt by replaying
+  the event stream. <strong>Solid</strong> tables are scheduling-owned, and a replay must never touch them —
+  a Humanity id living on a projection would be wiped by a rebuild, and the next publish run would create every
+  shift in Humanity a second time. Four tables are omitted here for legibility and are in the Mermaid version
+  alongside this file: <code>employee_store_assignments</code>, <code>employee_positions</code>,
+  <code>event_inbox</code>, <code>scheduling_outbox_events</code>. The two nullable pointers
+  <code>employees.primary_store_id</code> and <code>employees.primary_position_id</code> are likewise drawn only
+  in the Mermaid version, where they don't cross the diagram.
+</p>
+
+<h2 class="sr-only">Entity-relationship diagram. SHIFTS holds the planned schedule and WORK_SEGMENTS holds actual worked hours from TCP, joined by a nullable shift_id foreign key with ON DELETE SET NULL. EMPLOYEES is a flat projection of the hiring employee event. EMPLOYEE_REQUESTS with EMPLOYEE_REQUEST_DECISIONS records time off and cover requests and who decided them. EMPLOYEE_PAY_HISTORIES carries hourly rates for labour-cost estimates. store_settings and integration_identities are scheduling-owned and carry no foreign keys.</h2>
+
+<div class="erd-wrap">
+<div class="erd-canvas">
+
+<svg class="erd-lines" viewBox="0 0 1090 1040" width="1090" height="1040" aria-hidden="true">
+  <defs>
+    <marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L8 4 L0 8 z" fill="#888780"/>
+    </marker>
+    <marker id="ahk" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L8 4 L0 8 z" fill="#1D9E75"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="#888780" stroke-width="1" marker-end="url(#ah)">
+    <polyline points="386,82 330,82 330,67 252,67"/>
+    <polyline points="386,497 300,497 300,52 252,52"/>
+    <polyline points="132,336 132,308"/>
+    <polyline points="248,544 285,544 285,120 252,120"/>
+    <polyline points="248,696 315,696 315,140 252,140"/>
+    <polyline points="248,771 355,771 355,340 382,340"/>
+    <polyline points="132,875 132,847"/>
+    <polyline points="672,97 740,97 740,67 796,67"/>
+    <polyline points="672,542 770,542 770,82 796,82"/>
+    <polyline points="672,112 720,112 720,167 796,167"/>
+    <polyline points="672,557 755,557 755,182 796,182"/>
+    <polyline points="672,382 700,382 700,267 796,267"/>
+    <polyline points="672,707 740,707 740,282 796,282"/>
+  </g>
+  <polyline points="529,430 529,398" fill="none" stroke="#1D9E75" stroke-width="2" marker-end="url(#ahk)"/>
+
+  <text class="v" x="332" y="76" text-anchor="middle">scheduled for</text>
+  <text class="c" x="258" y="60" text-anchor="start">0..1</text>
+  <text class="v" x="302" y="470" text-anchor="middle">worked by</text>
+  <text class="c" x="258" y="45" text-anchor="start">1</text>
+  <text class="v v-key" x="535" y="422" text-anchor="start">reconciles to</text>
+  <text class="c" x="535" y="408" text-anchor="start">0..1</text>
+  <text class="v" x="140" y="325" text-anchor="start">available</text>
+  <text class="v" x="289" y="538" text-anchor="start">paid</text>
+  <text class="v" x="319" y="690" text-anchor="start">raised for</text>
+  <text class="v" x="359" y="765" text-anchor="start">about</text>
+  <text class="v" x="140" y="864" text-anchor="start">decides</text>
+  <text class="v" x="702" y="91" text-anchor="middle">at store</text>
+  <text class="v" x="717" y="536" text-anchor="middle">at store</text>
+  <text class="v" x="693" y="106" text-anchor="middle">as</text>
+  <text class="v" x="710" y="551" text-anchor="middle">as</text>
+  <text class="v" x="678" y="376" text-anchor="start">built by</text>
+  <text class="v" x="702" y="701" text-anchor="middle">approved by</text>
+</svg>
+
+<div class="ent proj e-gray" style="left:16px;top:30px;width:232px;height:274px">
+  <div class="ent-h"><span>employees</span><span class="ent-tag">hiring.v1</span></div>
+  <div class="ent-b">
+    <div class="r pk"><span class="n">id</span><span class="k">PK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">first_name</span><span class="k"></span><span class="t">varchar</span></div>
+    <div class="r"><span class="n">middle_name</span><span class="k"></span><span class="t">varchar?</span></div>
+    <div class="r"><span class="n">last_name</span><span class="k"></span><span class="t">varchar</span></div>
+    <div class="r hl"><span class="n">birth_date</span><span class="k"></span><span class="t">date?</span></div>
+    <div class="r"><span class="n">gender</span><span class="k"></span><span class="t">enum?</span></div>
+    <div class="r"><span class="n">employment_type</span><span class="k"></span><span class="t">enum</span></div>
+    <div class="r"><span class="n">primary_store_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">primary_position_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">primary_phone</span><span class="k"></span><span class="t">varchar?</span></div>
+    <div class="r"><span class="n">primary_email</span><span class="k"></span><span class="t">varchar?</span></div>
+    <div class="r"><span class="n">current_status</span><span class="k"></span><span class="t">enum?</span></div>
+    <div class="r"><span class="n">status_effective_date</span><span class="k"></span><span class="t">date?</span></div>
+    <div class="r hl"><span class="n">tcp_employee_id</span><span class="k">UK</span><span class="t">varchar?</span></div>
+    <div class="r hl"><span class="n">tcp_employee_record_id</span><span class="k"></span><span class="t">varchar?</span></div>
+    <div class="r"><span class="n">hiring_updated_at</span><span class="k"></span><span class="t">datetime?</span></div>
+  </div>
+</div>
+
+<div class="ent proj e-gray" style="left:16px;top:336px;width:232px;height:124px">
+  <div class="ent-h"><span>employee_availability_windows</span><span class="ent-tag">hiring.v1</span></div>
+  <div class="ent-b">
+    <div class="r pk"><span class="n">id</span><span class="k">PK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">employee_id</span><span class="k">FK</span><span class="t">bigint</span></div>
+    <div class="r hl"><span class="n">day_of_week</span><span class="k"></span><span class="t">enum</span></div>
+    <div class="r hl"><span class="n">available_from</span><span class="k"></span><span class="t">time</span></div>
+    <div class="r hl"><span class="n">available_to</span><span class="k"></span><span class="t">time</span></div>
+    <div class="r"><span class="n">shift_type</span><span class="k"></span><span class="t">enum?</span></div>
+  </div>
+</div>
+
+<div class="ent proj e-gray" style="left:16px;top:492px;width:232px;height:109px">
+  <div class="ent-h"><span>employee_pay_histories</span><span class="ent-tag">hiring.v1</span></div>
+  <div class="ent-b">
+    <div class="r pk"><span class="n">id</span><span class="k">PK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">employee_id</span><span class="k">FK</span><span class="t">bigint</span></div>
+    <div class="r hl"><span class="n">base_pay</span><span class="k"></span><span class="t">decimal</span></div>
+    <div class="r hl"><span class="n">performance_pay</span><span class="k"></span><span class="t">decimal</span></div>
+    <div class="r"><span class="n">effective_date</span><span class="k"></span><span class="t">date</span></div>
+  </div>
+</div>
+
+<div class="ent e-req" style="left:16px;top:644px;width:232px;height:199px">
+  <div class="ent-h"><span>employee_requests</span><span class="ent-tag">owned</span></div>
+  <div class="ent-b">
+    <div class="r pk"><span class="n">id</span><span class="k">PK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">employee_id</span><span class="k">FK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">request_type</span><span class="k"></span><span class="t">enum</span></div>
+    <div class="r"><span class="n">description</span><span class="k"></span><span class="t">text?</span></div>
+    <div class="r hl"><span class="n">start_date</span><span class="k"></span><span class="t">date?</span></div>
+    <div class="r hl"><span class="n">end_date</span><span class="k"></span><span class="t">date?</span></div>
+    <div class="r"><span class="n">shift_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">store_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+    <div class="r hl"><span class="n">status</span><span class="k"></span><span class="t">enum</span></div>
+    <div class="r"><span class="n">requested_by_user_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">created/updated_at</span><span class="k"></span><span class="t">datetime</span></div>
+  </div>
+</div>
+
+<div class="ent e-req" style="left:16px;top:875px;width:232px;height:124px">
+  <div class="ent-h"><span>employee_request_decisions</span><span class="ent-tag">owned</span></div>
+  <div class="ent-b">
+    <div class="r pk"><span class="n">id</span><span class="k">PK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">employee_request_id</span><span class="k">FK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">user_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">decision</span><span class="k"></span><span class="t">enum</span></div>
+    <div class="r"><span class="n">notes</span><span class="k"></span><span class="t">text?</span></div>
+    <div class="r"><span class="n">completed_at</span><span class="k"></span><span class="t">datetime?</span></div>
+  </div>
+</div>
+
+<div class="ent e-plan" style="left:386px;top:30px;width:286px;height:364px">
+  <div class="ent-h"><span>shifts</span><span class="ent-tag">PLANNED · owned</span></div>
+  <div class="ent-b">
+    <div class="r pk"><span class="n">id</span><span class="k">PK</span><span class="t">bigint</span></div>
+    <div class="r hl"><span class="n">employee_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">store_id</span><span class="k">FK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">position_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">business_date</span><span class="k"></span><span class="t">date</span></div>
+    <div class="r"><span class="n">start_at</span><span class="k"></span><span class="t">datetime</span></div>
+    <div class="r"><span class="n">end_at</span><span class="k"></span><span class="t">datetime</span></div>
+    <div class="r"><span class="n">unpaid_break_minutes</span><span class="k"></span><span class="t">smallint</span></div>
+    <div class="r"><span class="n">notes</span><span class="k"></span><span class="t">text?</span></div>
+    <div class="r"><span class="n">repeat_rule</span><span class="k"></span><span class="t">varchar</span></div>
+    <div class="r"><span class="n">repeat_until</span><span class="k"></span><span class="t">date?</span></div>
+    <div class="r"><span class="n">series_id</span><span class="k"></span><span class="t">ulid?</span></div>
+    <div class="r hl"><span class="n">split_group_id</span><span class="k"></span><span class="t">ulid?</span></div>
+    <div class="r hl"><span class="n">split_part</span><span class="k"></span><span class="t">tinyint?</span></div>
+    <div class="r"><span class="n">publish_state</span><span class="k"></span><span class="t">enum</span></div>
+    <div class="r"><span class="n">humanity_shift_id</span><span class="k">UK</span><span class="t">varchar?</span></div>
+    <div class="r"><span class="n">payload_fingerprint</span><span class="k"></span><span class="t">char(64)?</span></div>
+    <div class="r"><span class="n">published_at</span><span class="k"></span><span class="t">datetime?</span></div>
+    <div class="r"><span class="n">publish_attempts</span><span class="k"></span><span class="t">int</span></div>
+    <div class="r"><span class="n">last_publish_error</span><span class="k"></span><span class="t">text?</span></div>
+    <div class="r hl"><span class="n">availability_check</span><span class="k"></span><span class="t">enum</span></div>
+    <div class="r"><span class="n">created_by_user_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+  </div>
+</div>
+
+<div class="ent e-act" style="left:386px;top:430px;width:286px;height:424px">
+  <div class="ent-h"><span>work_segments</span><span class="ent-tag">ACTUAL · owned</span></div>
+  <div class="ent-b">
+    <div class="r pk"><span class="n">id</span><span class="k">PK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">tcp_segment_id</span><span class="k">UK</span><span class="t">varchar?</span></div>
+    <div class="r"><span class="n">employee_id</span><span class="k">FK</span><span class="t">bigint</span></div>
+    <div class="r hl"><span class="n">shift_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">match_source</span><span class="k"></span><span class="t">enum</span></div>
+    <div class="r"><span class="n">store_id</span><span class="k">FK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">position_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">business_date</span><span class="k"></span><span class="t">date</span></div>
+    <div class="r"><span class="n">time_in</span><span class="k"></span><span class="t">datetime</span></div>
+    <div class="r hl"><span class="n">time_out</span><span class="k"></span><span class="t">datetime?</span></div>
+    <div class="r"><span class="n">break_minutes</span><span class="k"></span><span class="t">smallint</span></div>
+    <div class="r"><span class="n">hours</span><span class="k"></span><span class="t">decimal?</span></div>
+    <div class="r"><span class="n">cost_code_name</span><span class="k"></span><span class="t">varchar?</span></div>
+    <div class="r"><span class="n">labor_code</span><span class="k"></span><span class="t">varchar?</span></div>
+    <div class="r"><span class="n">notes</span><span class="k"></span><span class="t">text?</span></div>
+    <div class="r"><span class="n">manager_approval</span><span class="k"></span><span class="t">bool</span></div>
+    <div class="r"><span class="n">approved_by_user_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">approved_at</span><span class="k"></span><span class="t">datetime?</span></div>
+    <div class="r"><span class="n">employee_approval</span><span class="k"></span><span class="t">bool</span></div>
+    <div class="r"><span class="n">origin</span><span class="k"></span><span class="t">enum</span></div>
+    <div class="r"><span class="n">times_corrected_at</span><span class="k"></span><span class="t">datetime?</span></div>
+    <div class="r"><span class="n">times_corrected_by_user_id</span><span class="k">FK?</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">tcp_updated_on</span><span class="k"></span><span class="t">datetime?</span></div>
+    <div class="r"><span class="n">tcp_synced_at</span><span class="k"></span><span class="t">datetime?</span></div>
+    <div class="r"><span class="n">tcp_payload</span><span class="k"></span><span class="t">json?</span></div>
+    <div class="r"><span class="n">created/updated/deleted_at</span><span class="k"></span><span class="t">datetime</span></div>
+  </div>
+</div>
+
+<div class="ent proj e-gray" style="left:800px;top:30px;width:250px;height:64px">
+  <div class="ent-h"><span>stores</span><span class="ent-tag">auth.v1</span></div>
+  <div class="ent-b">
+    <div class="r pk"><span class="n">id</span><span class="k">PK</span><span class="t">not auto-inc</span></div>
+    <div class="r"><span class="n">store_number</span><span class="k"></span><span class="t">varchar</span></div>
+  </div>
+</div>
+
+<div class="ent proj e-gray" style="left:800px;top:130px;width:250px;height:64px">
+  <div class="ent-h"><span>positions</span><span class="ent-tag">hiring.v1</span></div>
+  <div class="ent-b">
+    <div class="r pk"><span class="n">id</span><span class="k">PK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">label</span><span class="k"></span><span class="t">varchar</span></div>
+  </div>
+</div>
+
+<div class="ent proj e-gray" style="left:800px;top:230px;width:250px;height:79px">
+  <div class="ent-h"><span>users</span><span class="ent-tag">auth.v1</span></div>
+  <div class="ent-b">
+    <div class="r pk"><span class="n">id</span><span class="k">PK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">name</span><span class="k"></span><span class="t">varchar</span></div>
+    <div class="r"><span class="n">email</span><span class="k">UK</span><span class="t">varchar</span></div>
+  </div>
+</div>
+
+<div class="ent e-gray" style="left:800px;top:345px;width:250px;height:109px">
+  <div class="ent-h"><span>store_settings</span><span class="ent-tag">owned</span></div>
+  <div class="ent-b">
+    <div class="r pk"><span class="n">store_id</span><span class="k">UK</span><span class="t">bigint</span></div>
+    <div class="r hl"><span class="n">timezone</span><span class="k"></span><span class="t">varchar</span></div>
+    <div class="r"><span class="n">day_close_cutoff_time</span><span class="k"></span><span class="t">time?</span></div>
+    <div class="r"><span class="n">publish_lead_days</span><span class="k"></span><span class="t">smallint</span></div>
+    <div class="r"><span class="n">auto_publish</span><span class="k"></span><span class="t">bool</span></div>
+  </div>
+</div>
+
+<div class="ent e-gray" style="left:800px;top:490px;width:250px;height:184px">
+  <div class="ent-h"><span>integration_identities</span><span class="ent-tag">owned</span></div>
+  <div class="ent-b">
+    <div class="r pk"><span class="n">id</span><span class="k">PK</span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">entity_type</span><span class="k"></span><span class="t">enum</span></div>
+    <div class="r"><span class="n">entity_id</span><span class="k"></span><span class="t">bigint</span></div>
+    <div class="r"><span class="n">system</span><span class="k"></span><span class="t">tcp/human.</span></div>
+    <div class="r"><span class="n">external_id</span><span class="k"></span><span class="t">varchar?</span></div>
+    <div class="r"><span class="n">external_record_id</span><span class="k"></span><span class="t">varchar?</span></div>
+    <div class="r"><span class="n">sync_state</span><span class="k"></span><span class="t">enum</span></div>
+    <div class="r"><span class="n">attempts</span><span class="k"></span><span class="t">int</span></div>
+    <div class="r"><span class="n">last_error</span><span class="k"></span><span class="t">text?</span></div>
+    <div class="r"><span class="n">synced_at</span><span class="k"></span><span class="t">datetime?</span></div>
+  </div>
+</div>
+
+<div class="note" style="left:800px;top:682px;width:250px">No FK, and none on <code>store_settings.store_id</code> either — scheduling-owned rows must not be constrained by replayable ones.</div>
+
+</div>
+</div>
+
+<div class="legend">
+  <b><span class="sw" style="background:var(--plan-border)"></span>planned</b>
+  <b><span class="sw" style="background:var(--act-border)"></span>actual</b>
+  <b><span class="sw" style="background:var(--req-border)"></span>requests</b>
+  <b><span class="swb"></span>projection — rebuilt by replay</b>
+  <b><span class="sws"></span>scheduling-owned — replay must not touch</b>
+  <b><code>FK?</code> nullable FK</b>
+  <b><code>type?</code> nullable column</b>
+</div>
+
+<footer>
+  <p>
+    <strong>Three deliberate nulls.</strong>
+    <code>shifts.employee_id</code> — an open shift, placed before anyone is assigned.
+    <code>work_segments.time_out</code> — an open punch, which has no hours to approve and so blocks the day close as its own category.
+    <code>work_segments.shift_id</code> — unscheduled cover. It is <code>ON DELETE SET NULL</code>: deleting a plan must never delete the record of hours somebody worked.
+  </p>
+  <p>
+    <strong>A split shift is two rows, not one row with a gap.</strong> Both carry the same <code>split_group_id</code> and differ by <code>split_part</code>. One row stays one continuous block, so it maps 1:1 onto a Humanity shift and 1:1 onto the punches that reconcile against it — publishing, matching and editing need no special case. The gap between parts is implied by part 1's <code>end_at</code> and part 2's <code>start_at</code>, and is <em>not</em> <code>unpaid_break_minutes</code>: a break is time inside one block, a split gap is time between two. A split and a lunch break produce the same two punches; what tells them apart is whether those punches point at two shift rows or one.
+  </p>
+  <p>
+    <strong>Availability is a concrete hour range.</strong> One row is one window — Monday 16:00 to 21:00 — and several rows per day are expected, which is exactly what a split shift is validated against. An overnight window is encoded by column order rather than a flag that could contradict it: <code>available_to &lt; available_from</code> wraps past midnight, and <code>day_of_week</code> always names the day the window started on.
+  </p>
+  <p>
+    <strong>birth_date, not age.</strong> Age is derived and wrong on every employee's birthday, and it cannot answer the question that matters — minor labour rules turn on age <em>on the date of the shift</em>. Upstream it lives on <code>employee_obsessions</code>, not <code>employees</code>.
+  </p>
+  <p>
+    <strong>Not projected, though the hiring payload carries it:</strong> race, religion, t-shirt size, photo path, street address, emergency contacts. Race and religion in particular have no place in the system that decides who works when. <code>ssn</code> and bank account details are hidden upstream and never arrive.
+  </p>
+  <p>
+    <strong>Pay is here only to cost a schedule.</strong> <code>base_pay</code> and <code>performance_pay</code> are hourly, kept as history so a past week is costed at the rate that applied then. The estimate is computed in the query that renders the week, never cached on <code>shifts</code>. Nothing at the database level protects these rows — gate them in the application.
+  </p>
+  <p>
+    <strong>Unverified.</strong> Figures 1–25 of the workflow document are images, so the TCP and Humanity field lists were read from the surrounding prose rather than the field tables. <code>work_segments.tcp_payload</code> holds the raw response until that mapping is confirmed, and <code>repeat_rule</code> is a validated string rather than a 15-value enum for the same reason.
+  </p>
+</footer>
+
+</body>
+</html>

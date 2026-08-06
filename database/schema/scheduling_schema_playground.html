@@ -1,0 +1,548 @@
+<style>
+/* ────────────────────────────────────────────────────────────────
+   Schedule console — a live harness for the scheduling schema.
+   Palette continues the ERD: violet = planned, teal = actual.
+   Voice is monospace throughout; this is an operations tool.
+   ──────────────────────────────────────────────────────────────── */
+:root{
+  --bg:#EFEFF3; --surface:#FFFFFF; --surface-2:#F7F7FA; --sunken:#E7E7EE;
+  --line:#DCDCE4; --line-2:#C3C3D1;
+  --text:#1A1A22; --text-2:#585866; --text-3:#8A8A99;
+  --planned:#6E63D2; --planned-soft:#E9E7FA; --planned-ink:#2E2870;
+  --actual:#12876B; --actual-soft:#DDF1EB; --actual-ink:#0A4437;
+  --warn:#A96C08; --warn-soft:#FAEFD9; --crit:#AC3831; --crit-soft:#FAE7E5;
+  --ok:#2C7A58;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+  --sans:ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;
+  --r:5px;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#131419; --surface:#1B1C23; --surface-2:#22232C; --sunken:#101116;
+    --line:#2E3039; --line-2:#3F4251;
+    --text:#E9E9F0; --text-2:#A2A2B1; --text-3:#73738A;
+    --planned:#9A91F0; --planned-soft:#2A2560; --planned-ink:#D2CDFA;
+    --actual:#3FBF9B; --actual-soft:#0D3D32; --actual-ink:#A2E5D0;
+    --warn:#E0A340; --warn-soft:#3A2B10; --crit:#E5766E; --crit-soft:#3C1B18;
+    --ok:#4FC08D;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#131419; --surface:#1B1C23; --surface-2:#22232C; --sunken:#101116;
+  --line:#2E3039; --line-2:#3F4251;
+  --text:#E9E9F0; --text-2:#A2A2B1; --text-3:#73738A;
+  --planned:#9A91F0; --planned-soft:#2A2560; --planned-ink:#D2CDFA;
+  --actual:#3FBF9B; --actual-soft:#0D3D32; --actual-ink:#A2E5D0;
+  --warn:#E0A340; --warn-soft:#3A2B10; --crit:#E5766E; --crit-soft:#3C1B18;
+  --ok:#4FC08D;
+}
+:root[data-theme="light"]{
+  --bg:#EFEFF3; --surface:#FFFFFF; --surface-2:#F7F7FA; --sunken:#E7E7EE;
+  --line:#DCDCE4; --line-2:#C3C3D1;
+  --text:#1A1A22; --text-2:#585866; --text-3:#8A8A99;
+  --planned:#6E63D2; --planned-soft:#E9E7FA; --planned-ink:#2E2870;
+  --actual:#12876B; --actual-soft:#DDF1EB; --actual-ink:#0A4437;
+  --warn:#A96C08; --warn-soft:#FAEFD9; --crit:#AC3831; --crit-soft:#FAE7E5;
+  --ok:#2C7A58;
+}
+*{box-sizing:border-box}
+.pg{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13px;line-height:1.5;
+    padding:18px;display:flex;flex-direction:column;gap:14px;font-variant-numeric:tabular-nums}
+.pg h1,.pg h2,.pg h3{margin:0;font-family:var(--mono);font-weight:700}
+.pg p{margin:0}
+.lbl{font-family:var(--mono);font-size:9.5px;font-weight:700;letter-spacing:.11em;
+     text-transform:uppercase;color:var(--text-3)}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r)}
+.pad{padding:12px 14px}
+
+/* ── header ─────────────────────────────────────────────── */
+.head{display:flex;flex-wrap:wrap;gap:12px;align-items:stretch}
+.head .idplate{flex:1 1 240px;min-width:240px}
+.idplate h1{font-size:15px;letter-spacing:-.01em}
+.idplate .meta{font-family:var(--mono);font-size:11px;color:var(--text-2);margin-top:3px}
+.stat{flex:0 0 auto;min-width:132px;display:flex;flex-direction:column;justify-content:center}
+.stat .v{font-family:var(--mono);font-size:20px;font-weight:700;letter-spacing:-.02em;line-height:1.15}
+.stat .s{font-family:var(--mono);font-size:10px;color:var(--text-3);margin-top:1px}
+.gate{flex:1 1 300px;min-width:260px;border-left:4px solid var(--crit)}
+.gate.clear{border-left-color:var(--ok)}
+.gate ul{margin:6px 0 0;padding-left:16px;font-size:12px;color:var(--text-2)}
+.gate li{margin-bottom:2px}
+
+/* ── controls ───────────────────────────────────────────── */
+.ctl{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
+.f{display:flex;flex-direction:column;gap:3px}
+.f select,.f input{font-family:var(--mono);font-size:12px;padding:5px 7px;border-radius:4px;
+  border:1px solid var(--line-2);background:var(--surface-2);color:var(--text);min-height:29px}
+.f input{width:78px}
+button{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.03em;cursor:pointer;
+  padding:6px 11px;border-radius:4px;border:1px solid var(--line-2);
+  background:var(--surface-2);color:var(--text);min-height:29px;transition:background .12s,border-color .12s}
+button:hover{background:var(--sunken);border-color:var(--text-3)}
+button:focus-visible{outline:2px solid var(--planned);outline-offset:2px}
+button.primary{background:var(--planned-soft);border-color:var(--planned);color:var(--planned-ink);
+  box-shadow:inset 0 0 0 1px var(--planned)}
+button.primary:hover{background:var(--planned);color:var(--surface)}
+button.mini{padding:2px 6px;font-size:10px;min-height:0;letter-spacing:.02em}
+button.danger:hover{border-color:var(--crit);color:var(--crit)}
+
+/* ── timeline ───────────────────────────────────────────── */
+.board{overflow-x:auto}
+.tl{min-width:840px;position:relative}
+.tl-head{display:flex;border-bottom:1px solid var(--line);padding-bottom:4px;margin-bottom:6px}
+.tl-name{flex:0 0 168px}
+.tl-track{flex:1;position:relative;height:14px}
+.tick{position:absolute;top:0;font-family:var(--mono);font-size:9px;color:var(--text-3);
+  transform:translateX(-50%);white-space:nowrap}
+.row{display:flex;align-items:center;border-bottom:1px solid var(--line);padding:7px 0}
+.row:last-child{border-bottom:0}
+.who{flex:0 0 168px;padding-right:12px}
+.who .n{font-family:var(--mono);font-size:12px;font-weight:700}
+.who .d{font-family:var(--mono);font-size:9.5px;color:var(--text-3);display:flex;gap:5px;flex-wrap:wrap;margin-top:2px}
+.lane{flex:1;position:relative;height:46px;background:var(--sunken);border-radius:3px;overflow:hidden}
+.grid{position:absolute;inset:0;pointer-events:none}
+.grid i{position:absolute;top:0;bottom:0;width:1px;background:var(--line)}
+.avail{position:absolute;top:0;height:100%;background:var(--surface);border-left:1px solid var(--line-2);
+  border-right:1px solid var(--line-2)}
+.bar{position:absolute;border-radius:3px;font-family:var(--mono);font-size:9.5px;font-weight:700;
+  display:flex;align-items:center;padding:0 5px;overflow:hidden;white-space:nowrap;cursor:pointer;
+  border:1px solid transparent}
+.bar.plan{top:5px;height:21px;background:var(--planned-soft);color:var(--planned-ink);border-color:var(--planned)}
+.bar.plan.bad{border-style:dashed;border-color:var(--crit)}
+.bar.plan.open{background:transparent;border-style:dashed;border-color:var(--planned);color:var(--planned)}
+.bar.seg{top:30px;height:12px;background:var(--actual-soft);color:var(--actual-ink);border-color:var(--actual);font-size:9px}
+.bar.seg.unmatched{border-style:dotted}
+.bar.seg.openpunch{background:repeating-linear-gradient(135deg,var(--actual-soft),var(--actual-soft) 4px,transparent 4px,transparent 8px)}
+.bar.sel{outline:2px solid var(--text);outline-offset:1px}
+.splitlink{position:absolute;top:15px;height:2px;border-top:2px dotted var(--planned);opacity:.85}
+
+/* ── flags ──────────────────────────────────────────────── */
+.chip{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:9.5px;
+  font-weight:700;padding:1px 6px;border-radius:999px;letter-spacing:.02em;white-space:nowrap}
+.chip.ok{background:var(--actual-soft);color:var(--actual-ink)}
+.chip.warn{background:var(--warn-soft);color:var(--warn)}
+.chip.crit{background:var(--crit-soft);color:var(--crit)}
+.chip.neutral{background:var(--sunken);color:var(--text-2)}
+.chip.plan{background:var(--planned-soft);color:var(--planned-ink)}
+
+/* ── tables ─────────────────────────────────────────────── */
+.tables{display:flex;flex-direction:column;gap:12px}
+.tbl-wrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-family:var(--mono);font-size:10.5px;min-width:640px}
+caption{text-align:left;padding:0 0 6px;font-family:var(--mono);font-size:10px;font-weight:700;
+  letter-spacing:.09em;text-transform:uppercase;color:var(--text-2)}
+caption em{font-style:normal;color:var(--text-3);font-weight:400;letter-spacing:0;text-transform:none;font-size:10.5px}
+th{text-align:left;font-weight:700;color:var(--text-3);font-size:9px;letter-spacing:.06em;
+  text-transform:uppercase;padding:4px 8px;border-bottom:1px solid var(--line-2);white-space:nowrap}
+td{padding:4px 8px;border-bottom:1px solid var(--line);white-space:nowrap;color:var(--text-2)}
+tbody tr:hover td{background:var(--surface-2)}
+tbody tr.hot td{background:var(--planned-soft)}
+td.k{color:var(--text);font-weight:700}
+td.null{color:var(--text-3);font-style:italic}
+.empty{padding:10px;color:var(--text-3);font-family:var(--mono);font-size:10.5px}
+.note{font-size:11.5px;color:var(--text-2);max-width:74ch}
+.note code{font-family:var(--mono);font-size:11px;color:var(--text);background:var(--sunken);
+  padding:.5px 3px;border-radius:3px}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;font-family:var(--mono);
+  font-size:10px;color:var(--text-3)}
+.key{display:inline-block;width:16px;height:9px;border-radius:2px;vertical-align:middle;margin-right:4px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="pg">
+
+  <div class="head">
+    <div class="card pad idplate">
+      <h1>Store #4821 &middot; Monday 10 Aug 2026</h1>
+      <div class="meta">America/New_York &nbsp;·&nbsp; business_date 2026-08-10 &nbsp;·&nbsp; window 10:00 → 03:00</div>
+    </div>
+    <div class="card pad stat">
+      <div class="lbl">Planned cost</div>
+      <div class="v" id="cost">—</div>
+      <div class="s" id="costsub">—</div>
+    </div>
+    <div class="card pad stat">
+      <div class="lbl">Actual hours</div>
+      <div class="v" id="actual">—</div>
+      <div class="s" id="actualsub">—</div>
+    </div>
+    <div class="card pad gate" id="gate">
+      <div class="lbl">Day close</div>
+      <div id="gatebody"></div>
+    </div>
+  </div>
+
+  <div class="card pad">
+    <div class="lbl" style="margin-bottom:8px">Add a planned shift</div>
+    <div class="ctl">
+      <label class="f"><span class="lbl">Employee</span><select id="f-emp"></select></label>
+      <label class="f"><span class="lbl">Position</span><select id="f-pos"></select></label>
+      <label class="f"><span class="lbl">Start</span><input id="f-start" type="time" value="17:00"></label>
+      <label class="f"><span class="lbl">End</span><input id="f-end" type="time" value="21:00"></label>
+      <label class="f"><span class="lbl">Break min</span><input id="f-break" type="number" min="0" max="120" step="5" value="0"></label>
+      <button class="primary" id="add">Add shift</button>
+      <button id="punchall">Punch everyone in &amp; out</button>
+      <button id="approveall">Approve all hours</button>
+      <button class="danger" id="reset">Reset</button>
+    </div>
+    <p class="note" style="margin-top:9px">
+      Leave the employee as <code>— open shift —</code> to place a slot nobody is assigned to yet.
+      Cross midnight by setting an end earlier than the start.
+    </p>
+  </div>
+
+  <div class="card pad board">
+    <div class="lbl" style="margin-bottom:8px">The day</div>
+    <div class="tl">
+      <div class="tl-head"><div class="tl-name"></div><div class="tl-track" id="ticks"></div></div>
+      <div id="rows"></div>
+    </div>
+    <div class="legend" style="margin-top:10px">
+      <span><i class="key" style="background:var(--surface);border:1px solid var(--line-2)"></i>availability window</span>
+      <span><i class="key" style="background:var(--planned-soft);border:1px solid var(--planned)"></i>planned shift</span>
+      <span><i class="key" style="border:1px dashed var(--planned)"></i>open shift</span>
+      <span><i class="key" style="background:var(--actual-soft);border:1px solid var(--actual)"></i>worked</span>
+      <span><i class="key" style="border:1px dotted var(--actual)"></i>no matching shift</span>
+      <span>··· split parts</span>
+    </div>
+  </div>
+
+  <div class="tables">
+    <div class="card pad">
+      <div class="tbl-wrap"><table id="t-shifts"></table></div>
+    </div>
+    <div class="card pad">
+      <div class="tbl-wrap"><table id="t-segments"></table></div>
+    </div>
+    <div class="card pad">
+      <div class="tbl-wrap"><table id="t-avail"></table></div>
+    </div>
+    <div class="card pad">
+      <div class="tbl-wrap"><table id="t-requests"></table></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(() => {
+  const T0 = 600, T1 = 1620;                 // 10:00 → 03:00, minutes from midnight
+  const DATE = '2026-08-10', DOW = 'monday';
+  const pct = m => ((Math.max(T0, Math.min(T1, m)) - T0) / (T1 - T0)) * 100;
+  const hhmm = m => { const d = m >= 1440; const x = m % 1440;
+    return String(Math.floor(x / 60)).padStart(2,'0') + ':' + String(x % 60).padStart(2,'0') + (d ? '⁺' : ''); };
+  const stamp = m => (m >= 1440 ? '2026-08-11 ' : '2026-08-10 ') + hhmm(m).replace('⁺','') + ':00';
+  const parseT = v => { const [h,mm] = v.split(':').map(Number); return h*60 + mm; };
+  const uid = p => p + Math.random().toString(36).slice(2,8).toUpperCase();
+  const age = (dob, on) => { const b = new Date(dob), o = new Date(on);
+    let a = o.getFullYear() - b.getFullYear();
+    const md = o.getMonth() - b.getMonth();
+    if (md < 0 || (md === 0 && o.getDate() < b.getDate())) a--;
+    return a; };
+
+  const POSITIONS = [{id:1,label:'Driver'},{id:2,label:'Insider'},{id:3,label:'Shift Lead'}];
+
+  const seed = () => ({
+    employees: [
+      {id:1, first:'Ada',  last:'Okafor', dob:'2003-06-14', pos:2, base:17.50, perf:1.50,
+       windows:[{from:660,to:840},{from:1020,to:1260}]},                       // 11-14, 17-21
+      {id:2, first:'Ben',  last:'Ortiz',  dob:'2009-03-02', pos:1, base:15.00, perf:0.50,
+       windows:[{from:960,to:1260}]},                                          // 16-21
+      {id:3, first:'Cleo', last:'Nash',   dob:'1996-01-20', pos:3, base:19.00, perf:2.00,
+       windows:[{from:1200,to:120}]},                                          // 20:00 -> 02:00, wraps
+      {id:4, first:'Dov',  last:'Reyes',  dob:'2001-11-09', pos:1, base:16.00, perf:1.00,
+       windows:[{from:660,to:1320}]},                                          // 11-22
+    ],
+    shifts: [
+      {id:1, emp:1, pos:2, s:660,  e:840,  brk:0,  group:'SPLIT-A', part:1},
+      {id:2, emp:1, pos:2, s:1020, e:1260, brk:0,  group:'SPLIT-A', part:2},
+      {id:3, emp:2, pos:1, s:960,  e:1320, brk:30, group:null,      part:null},
+      {id:4, emp:3, pos:3, s:1260, e:1500, brk:0,  group:null,      part:null},
+      {id:5, emp:null, pos:1, s:1080, e:1320, brk:0, group:null,    part:null},
+    ],
+    segments: [
+      {id:1, emp:1, shift:1, in:658,  out:842,  appr:true,  tcp:'WS-8801'},
+      {id:2, emp:1, shift:2, in:1017, out:null, appr:false, tcp:'WS-8802'},
+      {id:3, emp:2, shift:3, in:962,  out:1325, appr:false, tcp:'WS-8803'},
+      {id:4, emp:4, shift:null, in:1140, out:1260, appr:false, tcp:'WS-8804'},
+    ],
+    requests: [
+      {id:1, emp:4, type:'time_off', from:'2026-08-10', to:'2026-08-12',
+       status:'approved', desc:'family trip'},
+      {id:2, emp:2, type:'availability_change', from:null, to:null,
+       status:'pending', desc:'can start at 15:00 from September'},
+    ],
+    nextShift: 6, nextSeg: 5,
+  });
+
+  let db = seed();
+  let sel = null;
+
+  const emp = id => db.employees.find(e => e.id === id);
+  const posName = id => (POSITIONS.find(p => p.id === id) || {}).label || '—';
+  const bands = e => e.windows.map(w => w.to > w.from ? {a:w.from, b:w.to} : {a:w.from, b:w.to + 1440});
+  const paid = s => (s.e - s.s - s.brk) / 60;
+  const rate = e => e.base + e.perf;
+
+  // ── the checks the schema is designed to answer ──────────────
+  const availabilityCheck = s => {
+    if (s.emp == null) return 'unknown';
+    return bands(emp(s.emp)).some(b => s.s >= b.a && s.e <= b.b) ? 'ok' : 'outside_availability';
+  };
+  const onApprovedLeave = id => db.requests.some(r =>
+    r.emp === id && r.type === 'time_off' && r.status === 'approved' && r.from <= DATE && r.to >= DATE);
+  const isMinor = id => age(emp(id).dob, DATE) < 18;
+
+  const flagsFor = s => {
+    const f = [];
+    if (s.emp == null) { f.push(['neutral','open shift']); return f; }
+    if (availabilityCheck(s) === 'outside_availability') f.push(['crit','outside availability']);
+    if (isMinor(s.emp)) f.push(['warn','minor · ' + age(emp(s.emp).dob, DATE)]);
+    if (onApprovedLeave(s.emp)) f.push(['crit','approved time off']);
+    return f;
+  };
+
+  // ── render ───────────────────────────────────────────────────
+  const el = id => document.getElementById(id);
+
+  function renderTicks() {
+    let h = '';
+    for (let m = T0; m <= T1; m += 60) h += `<span class="tick" style="left:${pct(m)}%">${hhmm(m)}</span>`;
+    el('ticks').innerHTML = h;
+  }
+  const gridHtml = () => {
+    let g = '<div class="grid">';
+    for (let m = T0 + 60; m < T1; m += 60) g += `<i style="left:${pct(m)}%"></i>`;
+    return g + '</div>';
+  };
+
+  function renderBoard() {
+    const rows = db.employees.map(e => {
+      const av = bands(e).map(b =>
+        `<div class="avail" style="left:${pct(b.a)}%;width:${pct(b.b) - pct(b.a)}%"></div>`).join('');
+
+      const sh = db.shifts.filter(s => s.emp === e.id).map(s => {
+        const bad = availabilityCheck(s) === 'outside_availability';
+        return `<div class="bar plan${bad ? ' bad' : ''}${sel === 's' + s.id ? ' sel' : ''}"
+          data-sel="s${s.id}" title="shift #${s.id} — ${hhmm(s.s)}→${hhmm(s.e)}"
+          style="left:${pct(s.s)}%;width:${Math.max(pct(s.e) - pct(s.s), 2)}%">
+          #${s.id}${s.part ? ' p' + s.part : ''} ${hhmm(s.s)}</div>`;
+      }).join('');
+
+      // dotted connector between the parts of one split
+      const groups = {};
+      db.shifts.filter(s => s.emp === e.id && s.group).forEach(s => (groups[s.group] ||= []).push(s));
+      const links = Object.values(groups).filter(g => g.length > 1).map(g => {
+        g.sort((a,b) => a.s - b.s);
+        const a = pct(g[0].e), b = pct(g[g.length - 1].s);
+        return `<div class="splitlink" style="left:${a}%;width:${Math.max(b - a, 0)}%"></div>`;
+      }).join('');
+
+      const sg = db.segments.filter(x => x.emp === e.id).map(x => {
+        const end = x.out ?? T1;
+        const cls = (x.shift == null ? ' unmatched' : '') + (x.out == null ? ' openpunch' : '');
+        return `<div class="bar seg${cls}${sel === 'g' + x.id ? ' sel' : ''}" data-sel="g${x.id}"
+          title="segment #${x.id} — ${x.out == null ? 'still clocked in' : hhmm(x.in) + '→' + hhmm(x.out)}"
+          style="left:${pct(x.in)}%;width:${Math.max(pct(end) - pct(x.in), 2)}%">
+          ${x.out == null ? 'open punch' : hhmm(x.in) + '→' + hhmm(x.out)}</div>`;
+      }).join('');
+
+      const chips = [];
+      if (isMinor(e.id)) chips.push('<span class="chip warn">minor</span>');
+      if (onApprovedLeave(e.id)) chips.push('<span class="chip crit">on leave</span>');
+
+      return `<div class="row"><div class="who">
+          <div class="n">${e.first} ${e.last}</div>
+          <div class="d"><span>${posName(e.pos)}</span><span>$${rate(e).toFixed(2)}/h</span>${chips.join('')}</div>
+        </div><div class="lane">${gridHtml()}${av}${links}${sh}${sg}</div></div>`;
+    }).join('');
+
+    const open = db.shifts.filter(s => s.emp == null).map(s =>
+      `<div class="bar plan open${sel === 's' + s.id ? ' sel' : ''}" data-sel="s${s.id}"
+        style="left:${pct(s.s)}%;width:${Math.max(pct(s.e) - pct(s.s), 2)}%">#${s.id} unfilled</div>`).join('');
+
+    el('rows').innerHTML = rows + (open
+      ? `<div class="row"><div class="who"><div class="n" style="color:var(--text-3)">— open shifts —</div>
+         <div class="d">employee_id IS NULL</div></div><div class="lane">${gridHtml()}${open}</div></div>` : '');
+  }
+
+  function renderStats() {
+    let cost = 0, hrs = 0;
+    db.shifts.forEach(s => { if (s.emp != null) { cost += paid(s) * rate(emp(s.emp)); hrs += paid(s); } });
+    el('cost').textContent = '$' + cost.toFixed(2);
+    el('costsub').textContent = hrs.toFixed(2) + ' planned h';
+
+    let worked = 0, openN = 0;
+    db.segments.forEach(x => { if (x.out == null) openN++; else worked += (x.out - x.in) / 60; });
+    el('actual').textContent = worked.toFixed(2) + 'h';
+    el('actualsub').textContent = openN ? openN + ' still clocked in' : 'all punched out';
+
+    const unappr = db.segments.filter(x => !x.appr && x.out != null);
+    const openP  = db.segments.filter(x => x.out == null);
+    const gate = el('gate'), body = el('gatebody');
+    if (!unappr.length && !openP.length) {
+      gate.classList.add('clear');
+      body.innerHTML = `<div style="font-family:var(--mono);font-weight:700;color:var(--ok);font-size:13px">
+        Ready to close</div><p class="note" style="margin-top:2px">Every segment is approved and nobody is still clocked in.</p>`;
+    } else {
+      gate.classList.remove('clear');
+      const li = [];
+      if (unappr.length) li.push(`<li><b>${unappr.length} unapproved</b> — ` +
+        unappr.map(x => emp(x.emp).first).join(', ') + '</li>');
+      if (openP.length) li.push(`<li><b>${openP.length} open punch${openP.length > 1 ? 'es' : ''}</b> — ` +
+        openP.map(x => emp(x.emp).first).join(', ') + ' — no hours to approve yet</li>');
+      body.innerHTML = `<div style="font-family:var(--mono);font-weight:700;color:var(--crit);font-size:13px">
+        Blocked</div><ul>${li.join('')}</ul>`;
+    }
+  }
+
+  const cell = (v, k) => v === null || v === undefined
+    ? '<td class="null">NULL</td>' : `<td class="${k ? 'k' : ''}">${v}</td>`;
+
+  function renderTables() {
+    // shifts
+    let h = `<caption>shifts &nbsp;<em>planned · scheduling-owned</em></caption><thead><tr>
+      <th>id</th><th>employee_id</th><th>position_id</th><th>business_date</th><th>start_at</th><th>end_at</th>
+      <th>break</th><th>split_group_id</th><th>part</th><th>availability_check</th><th>paid h</th><th>cost</th><th></th>
+      </tr></thead><tbody>`;
+    h += db.shifts.map(s => {
+      const chk = availabilityCheck(s);
+      const chip = `<span class="chip ${chk === 'ok' ? 'ok' : chk === 'unknown' ? 'neutral' : 'crit'}">${chk}</span>`;
+      const c = s.emp == null ? null : '$' + (paid(s) * rate(emp(s.emp))).toFixed(2);
+      return `<tr class="${sel === 's' + s.id ? 'hot' : ''}">
+        ${cell(s.id, 1)}${cell(s.emp)}${cell(s.pos)}<td>${DATE}</td>
+        <td>${stamp(s.s)}</td><td>${stamp(s.e)}</td>${cell(s.brk)}
+        ${cell(s.group)}${cell(s.part)}<td>${chip}</td><td>${paid(s).toFixed(2)}</td>${cell(c)}
+        <td><button class="mini" data-split="${s.id}">split</button>
+            <button class="mini" data-in="${s.id}">punch in</button>
+            <button class="mini danger" data-del="${s.id}">del</button></td></tr>`;
+    }).join('') || `<tr><td colspan="13" class="empty">no shifts</td></tr>`;
+    el('t-shifts').innerHTML = h + '</tbody>';
+
+    // work_segments
+    h = `<caption>work_segments &nbsp;<em>actual · scheduling-owned</em></caption><thead><tr>
+      <th>id</th><th>tcp_segment_id</th><th>employee_id</th><th>shift_id</th><th>match_source</th>
+      <th>business_date</th><th>time_in</th><th>time_out</th><th>hours</th><th>manager_approval</th><th></th>
+      </tr></thead><tbody>`;
+    h += db.segments.map(x => {
+      const ms = x.shift == null ? 'unmatched' : 'auto';
+      const hrs = x.out == null ? null : ((x.out - x.in) / 60).toFixed(2);
+      return `<tr class="${sel === 'g' + x.id ? 'hot' : ''}">
+        ${cell(x.id, 1)}${cell(x.tcp)}${cell(x.emp)}${cell(x.shift)}
+        <td><span class="chip ${x.shift == null ? 'warn' : 'neutral'}">${ms}</span></td>
+        <td>${DATE}</td><td>${stamp(x.in)}</td>
+        ${x.out == null ? '<td class="null">NULL — open punch</td>' : '<td>' + stamp(x.out) + '</td>'}
+        ${cell(hrs)}
+        <td><span class="chip ${x.appr ? 'ok' : 'crit'}">${x.appr}</span></td>
+        <td>${x.out == null
+              ? `<button class="mini" data-out="${x.id}">punch out</button>`
+              : `<button class="mini" data-appr="${x.id}">${x.appr ? 'unapprove' : 'approve'}</button>`}
+            <button class="mini danger" data-delseg="${x.id}">del</button></td></tr>`;
+    }).join('') || `<tr><td colspan="11" class="empty">no punches</td></tr>`;
+    el('t-segments').innerHTML = h + '</tbody>';
+
+    // availability
+    h = `<caption>employee_availability_windows &nbsp;<em>projection · from hiring.v1</em></caption><thead><tr>
+      <th>id</th><th>employee_id</th><th>day_of_week</th><th>available_from</th><th>available_to</th><th>reading</th>
+      </tr></thead><tbody>`;
+    let wid = 0;
+    h += db.employees.flatMap(e => e.windows.map(w => {
+      wid++;
+      const wraps = w.to < w.from;
+      return `<tr>${cell(wid, 1)}${cell(e.id)}<td>${DOW}</td>
+        <td>${hhmm(w.from).replace('⁺','')}:00</td><td>${hhmm(w.to).replace('⁺','')}:00</td>
+        <td><span class="chip ${wraps ? 'warn' : 'neutral'}">${wraps
+          ? 'to &lt; from → wraps past midnight' : 'same day'}</span></td></tr>`;
+    })).join('');
+    el('t-avail').innerHTML = h + '</tbody>';
+
+    // requests
+    h = `<caption>employee_requests &nbsp;<em>scheduling-owned</em></caption><thead><tr>
+      <th>id</th><th>employee_id</th><th>request_type</th><th>start_date</th><th>end_date</th>
+      <th>status</th><th>description</th><th></th></tr></thead><tbody>`;
+    h += db.requests.map(r => `<tr>${cell(r.id, 1)}${cell(r.emp)}<td>${r.type}</td>
+      ${cell(r.from)}${cell(r.to)}
+      <td><span class="chip ${r.status === 'approved' ? 'ok' : r.status === 'pending' ? 'neutral' : 'warn'}">${r.status}</span></td>
+      ${cell(r.desc)}
+      <td><button class="mini" data-toggle="${r.id}">${r.status === 'approved' ? 'revoke' : 'approve'}</button></td></tr>`)
+      .join('') || `<tr><td colspan="8" class="empty">no requests</td></tr>`;
+    el('t-requests').innerHTML = h + '</tbody>';
+  }
+
+  const draw = () => { renderBoard(); renderStats(); renderTables(); };
+
+  // ── actions ──────────────────────────────────────────────────
+  function addShift() {
+    const empId = el('f-emp').value === '' ? null : Number(el('f-emp').value);
+    let s = parseT(el('f-start').value), e = parseT(el('f-end').value);
+    if (e <= s) e += 1440;                               // crosses midnight
+    db.shifts.push({id: db.nextShift++, emp: empId, pos: Number(el('f-pos').value),
+      s, e, brk: Number(el('f-break').value) || 0, group: null, part: null});
+    draw();
+  }
+
+  function splitShift(id) {
+    const s = db.shifts.find(x => x.id === id);
+    if (!s) return;
+    if (!s.group) { s.group = uid('SPLIT-'); s.part = 1; }
+    const parts = db.shifts.filter(x => x.group === s.group);
+    const last = parts.reduce((a, b) => (b.e > a.e ? b : a));
+    const gap = 180, len = 180;                          // 3h unpaid gap, 3h second block
+    db.shifts.push({id: db.nextShift++, emp: s.emp, pos: s.pos,
+      s: last.e + gap, e: last.e + gap + len, brk: 0, group: s.group, part: parts.length + 1});
+    draw();
+  }
+
+  function punchIn(shiftId) {
+    const s = db.shifts.find(x => x.id === shiftId);
+    if (!s || s.emp == null) return;                     // an open shift has nobody to punch
+    db.segments.push({id: db.nextSeg, emp: s.emp, shift: s.id, in: s.s - 2, out: null,
+      appr: false, tcp: 'WS-' + (8900 + db.nextSeg)});
+    db.nextSeg++;
+    draw();
+  }
+
+  document.querySelector('.pg').addEventListener('click', ev => {
+    const b = ev.target.closest('button');
+    if (b) {
+      const d = b.dataset;
+      if (d.split)  return splitShift(Number(d.split));
+      if (d.in)     return punchIn(Number(d.in));
+      if (d.del)    { db.shifts = db.shifts.filter(x => x.id !== Number(d.del));
+                      db.segments.forEach(x => { if (x.shift === Number(d.del)) x.shift = null; }); return draw(); }
+      if (d.delseg) { db.segments = db.segments.filter(x => x.id !== Number(d.delseg)); return draw(); }
+      if (d.out)    { const x = db.segments.find(y => y.id === Number(d.out));
+                      const sh = db.shifts.find(y => y.id === x.shift);
+                      x.out = sh ? sh.e + 3 : x.in + 240; return draw(); }
+      if (d.appr)   { const x = db.segments.find(y => y.id === Number(d.appr)); x.appr = !x.appr; return draw(); }
+      if (d.toggle) { const r = db.requests.find(y => y.id === Number(d.toggle));
+                      r.status = r.status === 'approved' ? 'denied' : 'approved'; return draw(); }
+      return;
+    }
+    const bar = ev.target.closest('.bar');
+    if (bar) { sel = sel === bar.dataset.sel ? null : bar.dataset.sel; draw(); }
+  });
+
+  el('add').addEventListener('click', addShift);
+  el('reset').addEventListener('click', () => { db = seed(); sel = null; draw(); });
+  el('approveall').addEventListener('click', () => {
+    db.segments.forEach(x => { if (x.out != null) x.appr = true; }); draw();
+  });
+  el('punchall').addEventListener('click', () => {
+    db.shifts.forEach(s => {
+      if (s.emp == null) return;
+      if (db.segments.some(x => x.shift === s.id)) return;
+      db.segments.push({id: db.nextSeg, emp: s.emp, shift: s.id, in: s.s - 2, out: s.e + 3,
+        appr: false, tcp: 'WS-' + (8900 + db.nextSeg)});
+      db.nextSeg++;
+    });
+    draw();
+  });
+
+  el('f-emp').innerHTML = '<option value="">— open shift —</option>' +
+    seed().employees.map(e => `<option value="${e.id}">${e.first} ${e.last}</option>`).join('');
+  el('f-pos').innerHTML = POSITIONS.map(p => `<option value="${p.id}">${p.label}</option>`).join('');
+
+  renderTicks();
+  draw();
+})();
+</script>

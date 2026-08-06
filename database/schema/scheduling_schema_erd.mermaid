@@ -1,0 +1,279 @@
+%% Scheduling service — planned shifts vs. actual worked shifts
+%% Matches database/migrations/2026_08_05_0001*.php and 0002*.php
+%%
+%% Ownership, and it is the rule the whole schema turns on:
+%%
+%%   PROJECTION  — rebuilt by replaying the event stream. Nothing scheduling
+%%                 discovers for itself may live here.
+%%                 employees, employee_store_assignments, employee_positions,
+%%                 employee_availability_windows, employee_pay_histories,
+%%                 stores, positions, users
+%%
+%%   OWNED       — a replay must never touch it.
+%%                 shifts, work_segments, employee_requests,
+%%                 employee_request_decisions, store_settings,
+%%                 integration_identities, event_inbox,
+%%                 scheduling_outbox_events
+%%
+%% store_settings and integration_identities carry NO foreign keys on purpose:
+%% constraining non-replayable rows to replayable ones is the exact coupling
+%% they exist to avoid. Their logical parents are noted per table below.
+%%
+%% Not projected, though all of it arrives in the hiring payload: race,
+%% religion, t_shirt, image_path, street address, emergency contacts. ssn and
+%% bank details are hidden upstream and never arrive at all.
+
+erDiagram
+
+  %% ---- the two core tables -------------------------------------------
+  WORK_SEGMENTS              }o--o| SHIFTS                      : "reconciles to"
+
+  %% ---- core -> projections -------------------------------------------
+  SHIFTS                     }o--o| EMPLOYEES                   : "scheduled for"
+  SHIFTS                     }o--|| STORES                      : "hosted at"
+  SHIFTS                     }o--o| POSITIONS                   : "rostered as"
+  SHIFTS                     }o--o| USERS                       : "built by"
+  WORK_SEGMENTS              }o--|| EMPLOYEES                   : "worked by"
+  WORK_SEGMENTS              }o--|| STORES                      : "punched at"
+  WORK_SEGMENTS              }o--o| POSITIONS                   : "classified as"
+  WORK_SEGMENTS              }o--o| USERS                       : "approved by"
+
+  %% ---- requests ------------------------------------------------------
+  EMPLOYEE_REQUESTS          }o--|| EMPLOYEES                   : "raised for"
+  EMPLOYEE_REQUESTS          }o--o| SHIFTS                      : "about"
+  EMPLOYEE_REQUESTS          }o--o| STORES                      : "at"
+  EMPLOYEE_REQUESTS          }o--o| USERS                       : "filed by"
+  EMPLOYEE_REQUEST_DECISIONS }o--|| EMPLOYEE_REQUESTS           : "decides"
+  EMPLOYEE_REQUEST_DECISIONS }o--o| USERS                       : "decided by"
+
+  %% ---- inside the projection -----------------------------------------
+  EMPLOYEES                  }o--o| STORES                      : "primary store"
+  EMPLOYEES                  }o--o| POSITIONS                   : "primary position"
+  EMPLOYEE_STORE_ASSIGNMENTS }o--|| EMPLOYEES                   : "assigns"
+  EMPLOYEE_STORE_ASSIGNMENTS }o--|| STORES                      : "to"
+  EMPLOYEE_POSITIONS         }o--|| EMPLOYEES                   : "holds"
+  EMPLOYEE_POSITIONS         }o--|| POSITIONS                   : "of"
+  EMPLOYEE_AVAILABILITY_WINDOWS }o--|| EMPLOYEES                : "available"
+  EMPLOYEE_PAY_HISTORIES     }o--|| EMPLOYEES                   : "paid"
+
+  EMPLOYEES {
+    bigint id PK "assigned by hiring"
+    varchar first_name
+    varchar middle_name "nullable"
+    varchar last_name
+    date birth_date "nullable — NOT age; minor rules turn on age at the shift date"
+    enum gender "male|female, nullable"
+    enum employment_type "W2|1099"
+    bigint primary_store_id FK "nullable — board default; full set in the bridge"
+    bigint primary_position_id FK "nullable — board default; full set in the bridge"
+    varchar primary_phone "nullable — enough to say a shift moved"
+    varchar primary_email "nullable"
+    enum current_status "hired|resigned|terminated|rehired|OJE"
+    date current_status_effective_date "nullable"
+    varchar tcp_employee_id UK "nullable — from hiring employee_ids"
+    varchar tcp_employee_record_id "nullable — from hiring employee_ids"
+    datetime hiring_updated_at "nullable — guards against late delivery"
+    datetime created_at
+    datetime updated_at
+  }
+
+  SHIFTS {
+    bigint id PK
+    bigint employee_id FK "nullable — NULL is an open shift"
+    bigint store_id FK
+    bigint position_id FK "nullable"
+    date business_date "store-local day; stored, not derived"
+    datetime start_at "UTC"
+    datetime end_at "UTC"
+    smallint unpaid_break_minutes
+    text notes "nullable"
+    varchar repeat_rule "Figure 22; string until the 15 values are confirmed"
+    date repeat_until "nullable"
+    ulid series_id "nullable — one recurring series"
+    ulid split_group_id "nullable — two rows share it to form a split shift"
+    tinyint split_part "nullable — 1, 2, ... in time order"
+    enum publish_state "draft|queued|published|failed|unpublished"
+    varchar humanity_shift_id UK "nullable until published"
+    char payload_fingerprint "nullable — SHA-256 of last accepted payload"
+    datetime published_at "nullable"
+    int publish_attempts
+    text last_publish_error "nullable"
+    enum availability_check "ok|outside_availability|unknown — warns, never blocks"
+    bigint created_by_user_id FK "nullable"
+    datetime created_at
+    datetime updated_at
+    datetime deleted_at "nullable — soft delete"
+  }
+
+  WORK_SEGMENTS {
+    bigint id PK
+    varchar tcp_segment_id UK "nullable until POST /worksegments succeeds"
+    bigint employee_id FK
+    bigint shift_id FK "nullable — NULL is unscheduled cover; ON DELETE SET NULL"
+    enum match_source "unmatched|auto|manual"
+    bigint store_id FK
+    bigint position_id FK "nullable"
+    date business_date
+    datetime time_in
+    datetime time_out "nullable — an open punch"
+    smallint break_minutes
+    decimal hours "nullable — as TCP reports it, not derived"
+    varchar cost_code_name "nullable — Figure 14 filters by string"
+    varchar labor_code "nullable"
+    text notes "nullable"
+    boolean manager_approval "the day-close gate"
+    bigint approved_by_user_id FK "nullable"
+    datetime approved_at "nullable"
+    boolean employee_approval
+    enum origin "tcp_sync|manual_create"
+    datetime times_corrected_at "nullable — a correction clears approval"
+    bigint times_corrected_by_user_id FK "nullable"
+    datetime tcp_updated_on "nullable — drives incremental sync"
+    datetime tcp_synced_at "nullable"
+    json tcp_payload "nullable — raw response, field mapping unconfirmed"
+    datetime created_at
+    datetime updated_at
+    datetime deleted_at "nullable — soft delete"
+  }
+
+  EMPLOYEE_REQUESTS {
+    bigint id PK
+    bigint employee_id FK "the subject of the request"
+    enum request_type "time_off|shift_swap|cover_request|open_shift_claim|availability_change|other"
+    text description "nullable"
+    date start_date "nullable — a time-off request without dates is a note"
+    date end_date "nullable"
+    bigint shift_id FK "nullable — for cover/claim/swap; ON DELETE SET NULL"
+    bigint store_id FK "nullable"
+    enum status "pending|approved|denied|cancelled — cached from latest decision"
+    bigint requested_by_user_id FK "nullable — who typed it, not who it is about"
+    datetime created_at
+    datetime updated_at
+  }
+
+  EMPLOYEE_REQUEST_DECISIONS {
+    bigint id PK
+    bigint employee_request_id FK
+    bigint user_id FK "nullable — trail survives the user being removed"
+    enum decision "approved|denied|cancelled"
+    text notes "nullable"
+    datetime completed_at "nullable"
+    datetime created_at
+    datetime updated_at
+  }
+
+  EMPLOYEE_PAY_HISTORIES {
+    bigint id PK
+    bigint employee_id FK
+    decimal base_pay "hourly"
+    decimal performance_pay "hourly"
+    date effective_date "cost a shift at the rate in effect on its business_date"
+    datetime created_at
+    datetime updated_at
+  }
+
+  EMPLOYEE_AVAILABILITY_WINDOWS {
+    bigint id PK
+    bigint employee_id FK
+    enum day_of_week "the day the window STARTS on"
+    time available_from "e.g. 16:00"
+    time available_to "e.g. 21:00; if < from, the window wraps past midnight"
+    enum shift_type "AM|PM|OP, nullable — upstream descriptor only"
+    datetime created_at
+    datetime updated_at
+  }
+
+  EMPLOYEE_STORE_ASSIGNMENTS {
+    bigint id PK
+    bigint employee_id FK
+    bigint store_id FK
+    date effective_date "an employee may cover several stores at once"
+    datetime created_at
+    datetime updated_at
+  }
+
+  EMPLOYEE_POSITIONS {
+    bigint id PK
+    bigint employee_id FK
+    bigint position_id FK
+    date effective_date "an employee may hold several positions at once"
+    datetime created_at
+    datetime updated_at
+  }
+
+  STORES {
+    bigint id PK "assigned by auth; NOT auto-increment"
+    varchar store_number
+    datetime created_at
+    datetime updated_at
+  }
+
+  POSITIONS {
+    bigint id PK
+    varchar label
+    text description "nullable"
+    datetime created_at
+    datetime updated_at
+  }
+
+  USERS {
+    bigint id PK
+    varchar name
+    varchar email UK
+    datetime created_at
+    datetime updated_at
+  }
+
+  STORE_SETTINGS {
+    bigint id PK
+    bigint store_id UK "logical parent STORES — no FK, see header"
+    varchar timezone "turns UTC start_at into business_date"
+    time day_close_cutoff_time "nullable"
+    smallint publish_lead_days
+    boolean auto_publish
+    datetime created_at
+    datetime updated_at
+  }
+
+  INTEGRATION_IDENTITIES {
+    bigint id PK
+    enum entity_type "employee|store|position"
+    bigint entity_id "polymorphic — no FK, see header"
+    enum system "tcp|humanity"
+    varchar external_id "nullable until the remote create succeeds"
+    varchar external_record_id "nullable"
+    enum sync_state "pending|synced|failed"
+    int attempts
+    text last_error "nullable"
+    datetime synced_at "nullable"
+    datetime created_at
+    datetime updated_at
+  }
+
+  EVENT_INBOX {
+    bigint id PK
+    varchar event_id UK "CloudEvent ULID — makes redelivery idempotent"
+    varchar subject
+    varchar source "hiring-system | auth-system"
+    varchar stream
+    varchar consumer "durable pull consumer"
+    json payload
+    datetime processed_at "nullable"
+    int attempts
+    datetime parked_at "nullable"
+    text last_error "nullable"
+    datetime created_at
+    datetime updated_at
+  }
+
+  SCHEDULING_OUTBOX_EVENTS {
+    ulid id PK
+    varchar subject "scheduling.v1.*"
+    varchar type
+    json payload
+    int attempts
+    text last_error "nullable"
+    datetime published_at "nullable"
+    datetime created_at
+    datetime updated_at
+  }
