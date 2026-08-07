@@ -2,8 +2,10 @@
 
 namespace App\Models;
 
+use App\Casts\DateOnly;
 use App\Enums\MatchSource;
 use App\Enums\SegmentOrigin;
+use App\Enums\TcpSyncState;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -32,7 +34,8 @@ class WorkSegment extends Model
         return [
             'match_source' => MatchSource::class,
             'origin' => SegmentOrigin::class,
-            'business_date' => 'date',
+            'tcp_sync_state' => TcpSyncState::class,
+            'business_date' => DateOnly::class,
             'time_in' => 'datetime',
             'time_out' => 'datetime',
             'break_minutes' => 'integer',

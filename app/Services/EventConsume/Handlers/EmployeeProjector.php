@@ -7,6 +7,7 @@ use App\Enums\DayOfWeek;
 use App\Enums\EmployeeStatus;
 use App\Enums\EmploymentType;
 use App\Enums\Gender;
+use App\Jobs\PushEmployeeToTcp;
 use App\Models\Employee;
 use App\Models\EmployeeAvailabilityWindow;
 use App\Models\EmployeePayHistory;
@@ -83,6 +84,26 @@ class EmployeeProjector
             $this->replacePositions($id, $payload);
             $this->replacePayHistories($id, $payload);
             $this->replaceAvailabilityWindows($id, $payload);
+
+            /**
+             * Mirror the person into TCP.
+             *
+             * The source document has hiring doing this; hiring makes no HTTP
+             * calls to TCP at all, and scheduling owns every other TCP call, so
+             * the push is triggered from the event hiring already publishes.
+             *
+             * QUEUED, and afterCommit. Calling the vendor inline would hold the
+             * JetStream consumer open on somebody else's latency: a timeout
+             * would nack the event, redeliver it, and after five attempts park
+             * it — losing the projection over a problem with a different
+             * system. afterCommit so the worker cannot read a half-written
+             * employee, or none at all on a create.
+             *
+             * Create, update and termination all route here. Termination is an
+             * update carrying a terminated status, never a DELETE — see
+             * TcpEmployeeWriter.
+             */
+            PushEmployeeToTcp::dispatch($id)->afterCommit();
         });
     }
 

@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Casts\DateOnly;
 use App\Enums\AvailabilityCheck;
 use App\Enums\PublishState;
 use Illuminate\Database\Eloquent\Builder;
@@ -35,11 +36,11 @@ class Shift extends Model
     protected function casts(): array
     {
         return [
-            'business_date' => 'date',
+            'business_date' => DateOnly::class,
             'start_at' => 'datetime',
             'end_at' => 'datetime',
             'unpaid_break_minutes' => 'integer',
-            'repeat_until' => 'date',
+            'repeat_until' => DateOnly::class,
             'split_part' => 'integer',
             'publish_state' => PublishState::class,
             'published_at' => 'datetime',

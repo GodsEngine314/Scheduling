@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Casts\DateOnly;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -26,7 +27,7 @@ class EmployeePayHistory extends Model
         return [
             'base_pay' => 'decimal:2',
             'performance_pay' => 'decimal:2',
-            'effective_date' => 'date',
+            'effective_date' => DateOnly::class,
         ];
     }
 

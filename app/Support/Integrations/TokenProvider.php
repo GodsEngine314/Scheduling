@@ -119,12 +119,12 @@ class TokenProvider
         $token = (string) ($response->json('access_token') ?? '');
 
         if ($token === '') {
-            throw IntegrationException::fromResponse(
+            // A 200 with no token is a contract problem, not a blip. Retrying
+            // it would just produce the same useless response.
+            throw IntegrationException::guard(
                 $integration,
-                'POST',
                 $endpoint,
-                $response->status(),
-                $correlationId,
+                "{$integration} returned a successful token response with no access_token.",
             );
         }
 

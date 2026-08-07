@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Casts\DateOnly;
 use App\Enums\EmployeeStatus;
 use App\Enums\EmploymentType;
 use App\Enums\Gender;
@@ -26,11 +27,11 @@ class Employee extends Model
     protected function casts(): array
     {
         return [
-            'birth_date' => 'date',
+            'birth_date' => DateOnly::class,
             'gender' => Gender::class,
             'employment_type' => EmploymentType::class,
             'current_status' => EmployeeStatus::class,
-            'current_status_effective_date' => 'date',
+            'current_status_effective_date' => DateOnly::class,
             'hiring_updated_at' => 'datetime',
         ];
     }

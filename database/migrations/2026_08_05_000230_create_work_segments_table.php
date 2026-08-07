@@ -39,7 +39,8 @@ return new class extends Migration {
             $table->enum('match_source', ['unmatched', 'auto', 'manual'])->default('unmatched');
 
             $table->foreignId('store_id')->constrained('stores')->restrictOnDelete();
-            $table->foreignId('position_id')->nullable()->constrained('positions')->restrictOnDelete();
+            // See the shifts migration: a projection must stay deletable.
+            $table->foreignId('position_id')->nullable()->constrained('positions')->nullOnDelete();
 
             $table->date('business_date');
             $table->dateTime('time_in');
@@ -80,6 +81,18 @@ return new class extends Migration {
             $table->timestamp('tcp_updated_on')->nullable();
             $table->timestamp('tcp_synced_at')->nullable();
 
+            // Write-back state. An edit here is saved locally first and pushed
+            // to TCP by a queued job, so a TCP outage never blocks a manager
+            // approving hours — but the divergence has to be VISIBLE, or the
+            // two systems drift silently and payroll pays the local number.
+            //   pending  local change not yet pushed
+            //   synced   TCP has accepted our version
+            //   failed   TCP rejected it; tcp_sync_error says why
+            //   local    deliberately never pushed
+            $table->enum('tcp_sync_state', ['pending', 'synced', 'failed', 'local'])->default('local');
+            $table->unsignedInteger('tcp_sync_attempts')->default(0);
+            $table->text('tcp_sync_error')->nullable();
+
             // The raw response. The workflow document's field tables are images
             // that could not be read, so this is the safety net: nothing in a
             // real payload is lost while the column mapping is unconfirmed.
@@ -97,6 +110,8 @@ return new class extends Migration {
             $table->index(['store_id', 'business_date', 'time_out']);          // open punches
             $table->index(['store_id', 'business_date', 'manager_approval']);  // the close gate
             $table->index('tcp_updated_on');
+            // The retry sweep: everything TCP has not accepted yet.
+            $table->index(['tcp_sync_state', 'tcp_sync_attempts']);
         });
 
         // See the note in the shifts migration: MySQL only.

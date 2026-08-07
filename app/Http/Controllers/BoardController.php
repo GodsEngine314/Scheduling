@@ -1,0 +1,449 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Enums\PublishState;
+use App\Enums\RequestDecision;
+use App\Exceptions\SchedulingException;
+use App\Models\EmployeeRequest;
+use App\Models\Position;
+use App\Models\Shift;
+use App\Models\Store;
+use App\Models\User;
+use App\Models\WorkSegment;
+use App\Models\Employee;
+use App\Services\Scheduling\BoardService;
+use App\Services\Scheduling\DayCloseService;
+use App\Services\Scheduling\EmployeeRequestService;
+use App\Services\Scheduling\LaborCostEstimator;
+use App\Services\Scheduling\ShiftService;
+use App\Services\Scheduling\WorkSegmentService;
+use App\Support\BusinessDay;
+use Database\Seeders\DemoSeeder;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\View\View;
+use Throwable;
+
+/**
+ * The web console. Deliberately thin: every button routes to the same service
+ * the API calls, so clicking around here exercises the real domain code rather
+ * than a parallel implementation of it.
+ *
+ * Server-rendered and POST-then-redirect throughout. No build step, no client
+ * state to drift out of sync with the database — the page you are looking at is
+ * a query result, always.
+ */
+class BoardController extends Controller
+{
+    public function __construct(
+        private readonly BoardService $board,
+        private readonly ShiftService $shifts,
+        private readonly WorkSegmentService $segments,
+        private readonly EmployeeRequestService $requests,
+        private readonly DayCloseService $dayClose,
+        private readonly LaborCostEstimator $costs,
+        private readonly BusinessDay $businessDay,
+    ) {}
+
+    public function index(Request $request): View
+    {
+        $stores = Store::query()->orderBy('id')->get();
+        $storeId = (int) ($request->query('store') ?: $stores->first()?->id ?: DemoSeeder::STORE_ID);
+
+        $date = (string) ($request->query('date')
+            ?: $this->businessDay->toLocal($storeId, now())->toDateString());
+
+        $board = $this->board->forDate($storeId, $date);
+
+        $shifts = Shift::query()
+            ->with(['employee', 'position'])
+            ->forBoard($storeId, $date)
+            ->get();
+
+        $segments = WorkSegment::query()
+            ->with(['employee', 'shift'])
+            ->forBoard($storeId, $date)
+            ->get();
+
+        // One conflicts() call per shift. Cheap at a store-day's volume, and it
+        // is the whole point of the screen: the warnings must be visible at the
+        // moment you look at the shift, not behind another click.
+        $conflicts = $shifts->mapWithKeys(
+            fn (Shift $shift): array => [$shift->id => $this->shifts->conflicts($shift)]
+        );
+
+        return view('board.index', [
+            'stores' => $stores,
+            'storeId' => $storeId,
+            'date' => $date,
+            'board' => $board,
+            'shifts' => $shifts,
+            'segments' => $segments,
+            'conflicts' => $conflicts,
+            'positions' => Position::query()->orderBy('id')->get(),
+            'roster' => $this->roster($storeId, $date),
+            'requests' => EmployeeRequest::query()
+                ->with(['employee', 'decisions'])
+                ->where('store_id', $storeId)
+                ->orderByDesc('id')
+                ->get(),
+            'timezone' => $board['timezone'],
+        ]);
+    }
+
+    public function storeShift(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'store_id' => ['required', 'integer'],
+            'date' => ['required', 'date_format:Y-m-d'],
+            'employee_id' => ['nullable', 'integer', 'exists:employees,id'],
+            'position_id' => ['nullable', 'integer', 'exists:positions,id'],
+            'start' => ['required', 'date_format:H:i'],
+            'end' => ['required', 'date_format:H:i'],
+            'unpaid_break_minutes' => ['nullable', 'integer', 'min:0', 'max:240'],
+            'notes' => ['nullable', 'string', 'max:500'],
+        ]);
+
+        // An end at or before the start is a deliberate overnight shift, not a
+        // mistake — roll it to the next calendar day rather than rejecting it.
+        $endDate = $data['end'] <= $data['start']
+            ? now()->parse($data['date'])->addDay()->toDateString()
+            : $data['date'];
+
+        return $this->attempt($request, fn () => $this->shifts->create([
+            'store_id' => (int) $data['store_id'],
+            'employee_id' => $data['employee_id'] ?? null,
+            'position_id' => $data['position_id'] ?? null,
+            'start_at_local' => "{$data['date']} {$data['start']}:00",
+            'end_at_local' => "{$endDate} {$data['end']}:00",
+            'unpaid_break_minutes' => (int) ($data['unpaid_break_minutes'] ?? 0),
+            'notes' => $data['notes'] ?? null,
+            'created_by_user_id' => User::query()->value('id'),
+        ]), 'Shift added.');
+    }
+
+    /**
+     * Edit a PLANNED shift. Local only — nothing reaches Humanity here.
+     *
+     * "The whole scheduling will be handled on our platform until the user hit
+     * publish." A POST to Humanity goes live the moment it lands, so an edit
+     * must not push. ShiftService::update nulls payload_fingerprint when a
+     * Humanity-visible field changes, which is what makes the NEXT publish run
+     * re-send this shift instead of skipping it as unchanged.
+     */
+    public function updateShift(Request $request, Shift $shift): RedirectResponse
+    {
+        $data = $request->validate([
+            'date' => ['required', 'date_format:Y-m-d'],
+            'employee_id' => ['nullable', 'integer', 'exists:employees,id'],
+            'position_id' => ['nullable', 'integer', 'exists:positions,id'],
+            'start' => ['required', 'date_format:H:i'],
+            'end' => ['required', 'date_format:H:i'],
+            'unpaid_break_minutes' => ['nullable', 'integer', 'min:0', 'max:240'],
+            'notes' => ['nullable', 'string', 'max:500'],
+        ]);
+
+        $endDate = $data['end'] <= $data['start']
+            ? now()->parse($data['date'])->addDay()->toDateString()
+            : $data['date'];
+
+        $wasPublished = $shift->publish_state === PublishState::Published;
+
+        return $this->attempt($request, function () use ($shift, $data, $endDate) {
+            return $this->shifts->update($shift, [
+                'store_id' => $shift->store_id,
+                'employee_id' => $data['employee_id'] ?? null,
+                'position_id' => $data['position_id'] ?? null,
+                'start_at_local' => "{$data['date']} {$data['start']}:00",
+                'end_at_local' => "{$endDate} {$data['end']}:00",
+                'unpaid_break_minutes' => (int) ($data['unpaid_break_minutes'] ?? 0),
+                'notes' => $data['notes'] ?? null,
+            ]);
+        }, "Shift #{$shift->id} updated locally."
+            .($wasPublished
+                ? ' It is already in Humanity, so the next publish run will send the change.'
+                : ' Nothing has been sent to Humanity — it is still a draft.'));
+    }
+
+    /**
+     * Edit an ACTUAL shift: the document's Change Shift workflow.
+     *
+     * Saved locally, then pushed to TCP by a queued job. A correction clears
+     * manager_approval unless the caller re-approves, so hours nobody has
+     * reviewed since the change cannot sit there marked approved.
+     */
+    public function updateSegment(Request $request, WorkSegment $segment): RedirectResponse
+    {
+        $data = $request->validate([
+            'date' => ['required', 'date_format:Y-m-d'],
+            'time_in' => ['required', 'date_format:H:i'],
+            'time_out' => ['nullable', 'date_format:H:i'],
+            'reapprove' => ['nullable', 'boolean'],
+        ]);
+
+        $outDate = ($data['time_out'] ?? null) !== null && $data['time_out'] <= $data['time_in']
+            ? now()->parse($data['date'])->addDay()->toDateString()
+            : $data['date'];
+
+        $reapprove = (bool) ($data['reapprove'] ?? false);
+        $storeId = (int) $segment->store_id;
+
+        // correctTimes() takes UTC INSTANTS — a bare string is parsed as UTC,
+        // not as store-local. The form collects wall-clock time, so it has to
+        // be converted here or a 09:30 correction lands as 05:30 and every
+        // edit silently shifts by the store's offset.
+        $timeIn = $this->businessDay->combine($storeId, $data['date'], $data['time_in'].':00');
+        $timeOut = ($data['time_out'] ?? null) === null
+            ? null
+            : $this->businessDay->combine($storeId, $outDate, $data['time_out'].':00');
+
+        return $this->attempt($request, fn () => $this->segments->correctTimes(
+            $segment,
+            $timeIn,
+            $timeOut,
+            $reapprove,
+            User::query()->value('id'),
+        ), "Segment #{$segment->id} corrected and queued for TCP."
+            .($reapprove ? ' Re-approved as instructed.' : ' Approval cleared — it needs reviewing again.'));
+    }
+
+    /**
+     * Create the next part of a split.
+     *
+     * Takes explicit wall-clock times rather than a gap, because a gap hides
+     * the thing most likely to surprise you: three hours after a shift ending
+     * at 22:00 puts part 2 at 01:00, on the NEXT business_date, where it drops
+     * off this board entirely. With real times the dialog can say so before you
+     * commit. A gap/length pair is still accepted for scripted callers.
+     */
+    public function splitShift(Request $request, Shift $shift): RedirectResponse
+    {
+        $data = $request->validate([
+            'date' => ['nullable', 'date_format:Y-m-d'],
+            'second_start' => ['nullable', 'date_format:H:i'],
+            'second_end' => ['nullable', 'date_format:H:i'],
+            'gap_minutes' => ['nullable', 'integer', 'min:1', 'max:720'],
+            'length_minutes' => ['nullable', 'integer', 'min:15', 'max:720'],
+        ]);
+
+        $storeId = (int) $shift->store_id;
+
+        if (($data['second_start'] ?? null) !== null && ($data['second_end'] ?? null) !== null) {
+            // The day part 1 ENDS on, not its business_date: a part 1 that
+            // already runs past midnight has its successor on the later day.
+            $baseDate = $data['date']
+                ?? $this->businessDay->toLocal($storeId, $shift->end_at)->toDateString();
+
+            $start = $this->businessDay->combine($storeId, $baseDate, $data['second_start'].':00');
+            $end = $this->businessDay->combine($storeId, $baseDate, $data['second_end'].':00');
+
+            // Both ends roll forward together when the block crosses midnight,
+            // and the start rolls on its own when it lands before part 1 ends.
+            if ($end->lessThanOrEqualTo($start)) {
+                $end = $end->addDay();
+            }
+
+            if ($start->lessThan($shift->end_at)) {
+                $start = $start->addDay();
+                $end = $end->addDay();
+            }
+        } else {
+            $gap = (int) ($data['gap_minutes'] ?? 180);
+            $length = (int) ($data['length_minutes'] ?? 180);
+
+            // copy() on every step: the datetime cast is a MUTABLE Carbon, so
+            // arithmetic on end_at would rewrite the model's own attribute and
+            // hand back the same instance for both ends.
+            $start = $shift->end_at->copy()->addMinutes($gap);
+            $end = $start->copy()->addMinutes($length);
+        }
+
+        $gapMinutes = (int) $shift->end_at->diffInMinutes($start);
+        $newDay = $this->businessDay->businessDate($storeId, $start);
+
+        // Compare against part 1's OWN business_date, not the day it ends on.
+        // Those differ precisely when part 1 already crosses midnight, which is
+        // the case most likely to strand part 2 on a date nobody is looking at.
+        $part1Day = $shift->business_date instanceof \Carbon\CarbonInterface
+            ? $shift->business_date->toDateString()
+            : (string) $shift->business_date;
+        $sameDay = $newDay === $part1Day;
+
+        return $this->attempt(
+            $request,
+            fn () => $this->shifts->split($shift, $start, $end),
+            "Shift #{$shift->id} split: part 2 runs "
+                .$this->businessDay->toLocal($storeId, $start)->format('H:i')
+                .' to '.$this->businessDay->toLocal($storeId, $end)->format('H:i')
+                .", after a {$gapMinutes} minute unpaid gap that is not a break."
+                .($sameDay ? '' : " It falls on {$newDay}, so open that date to see it."),
+        );
+    }
+
+    public function destroyShift(Request $request, Shift $shift): RedirectResponse
+    {
+        $rule = $request->input('rule', 'following');
+
+        // Soft delete, so punches keep pointing at the row and the
+        // reconciliation survives — shift_id only drops to NULL on a HARD
+        // delete, which is when the ON DELETE SET NULL rule actually fires.
+        // Saying "shift_id NULL" here would be a lie about what just happened.
+        $keptPunches = $shift->workSegments()->count();
+
+        return $this->attempt(
+            $request,
+            fn () => $this->shifts->delete($shift, $rule),
+            "Shift #{$shift->id} soft-deleted (rule: {$rule})."
+                .($keptPunches > 0
+                    ? " Its {$keptPunches} punch(es) still reference it, so the pairing survives a restore."
+                    : ''),
+        );
+    }
+
+    /** Clock someone in against a shift, two minutes early, as people do. */
+    public function punchIn(Request $request, Shift $shift): RedirectResponse
+    {
+        if ($shift->employee_id === null) {
+            return back()->with('err', 'An open shift has nobody to clock in.');
+        }
+
+        return $this->attempt($request, fn () => $this->segments->create([
+            'store_id' => $shift->store_id,
+            'employee_id' => $shift->employee_id,
+            'position_id' => $shift->position_id,
+            // copy(): a mutable Carbon here would rewind the shift's own start_at.
+            'time_in' => $shift->start_at->copy()->subMinutes(2),
+        ]), "Clocked in against shift #{$shift->id}.");
+    }
+
+    public function punchOut(Request $request, WorkSegment $segment): RedirectResponse
+    {
+        $out = $segment->shift?->end_at?->copy()->addMinutes(3)
+            ?? $segment->time_in->copy()->addHours(4);
+
+        return $this->attempt(
+            $request,
+            fn () => $this->segments->correctTimes($segment, null, $out),
+            "Clocked out. The hours are now approvable.",
+        );
+    }
+
+    public function approveSegment(Request $request, WorkSegment $segment): RedirectResponse
+    {
+        return $this->attempt(
+            $request,
+            fn () => $this->segments->approve($segment, User::query()->value('id')),
+            "Segment #{$segment->id} approved.",
+        );
+    }
+
+    public function destroySegment(Request $request, WorkSegment $segment): RedirectResponse
+    {
+        return $this->attempt($request, fn () => $this->segments->delete($segment), 'Punch deleted.');
+    }
+
+    public function approveAll(Request $request): RedirectResponse
+    {
+        $ids = WorkSegment::query()
+            ->forBoard((int) $request->input('store_id'), (string) $request->input('date'))
+            ->unapproved()
+            ->pluck('id')
+            ->all();
+
+        if ($ids === []) {
+            return back()->with('err', 'Nothing to approve. Open punches cannot be approved — they have no hours yet.');
+        }
+
+        return $this->attempt(
+            $request,
+            fn () => $this->segments->approveMany($ids, User::query()->value('id')),
+            count($ids).' segment(s) approved.',
+        );
+    }
+
+    public function closeDay(Request $request): RedirectResponse
+    {
+        try {
+            $result = $this->dayClose->close(
+                (int) $request->input('store_id'),
+                (string) $request->input('date'),
+                User::query()->value('id'),
+            );
+
+            return back()->with('ok', 'Day closed at '.$result['closed_at'].'.');
+        } catch (SchedulingException $e) {
+            return back()->with('err', $e->getMessage());
+        } catch (Throwable $e) {
+            return back()->with('err', $e->getMessage());
+        }
+    }
+
+    public function decideRequest(Request $request, EmployeeRequest $employeeRequest): RedirectResponse
+    {
+        $decision = RequestDecision::tryFrom((string) $request->input('decision'));
+
+        if ($decision === null) {
+            return back()->with('err', 'Unknown decision.');
+        }
+
+        return $this->attempt(
+            $request,
+            fn () => $this->requests->decide($employeeRequest, $decision, User::query()->value('id')),
+            "Request #{$employeeRequest->id} {$decision->value}. The previous decision is kept in the trail.",
+        );
+    }
+
+    public function reseed(): RedirectResponse
+    {
+        Artisan::call('db:seed', ['--class' => 'DemoSeeder', '--force' => true]);
+
+        return redirect()->route('board')->with('ok', 'Demo data reset.');
+    }
+
+    /**
+     * Run a service call, turn a domain refusal into a readable message rather
+     * than a stack trace. SchedulingException is the domain saying no on
+     * purpose — approving an open punch, ending a shift before it starts — and
+     * the console should show exactly that sentence.
+     */
+    private function attempt(Request $request, callable $work, string $success): RedirectResponse
+    {
+        try {
+            $work();
+
+            return back()->with('ok', $success);
+        } catch (SchedulingException $e) {
+            return back()->with('err', $e->getMessage());
+        } catch (Throwable $e) {
+            return back()->with('err', class_basename($e).': '.$e->getMessage());
+        }
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    private function roster(int $storeId, string $date): array
+    {
+        return Employee::query()
+            ->with('availabilityWindows')
+            ->where('primary_store_id', $storeId)
+            ->orderBy('first_name')
+            ->get()
+            ->map(function (Employee $employee) use ($date): array {
+                $rate = $this->costs->rateOn($employee->id, $date);
+                $dow = strtolower(now()->parse($date)->format('l'));
+
+                return [
+                    'model' => $employee,
+                    'age' => $employee->birth_date?->diffInYears(now()->parse($date)),
+                    'rate' => $rate === null ? null : (float) $rate->base_pay + (float) $rate->performance_pay,
+                    // day_of_week is an enum cast, so compare the backing
+                    // value rather than relying on a dotted string path.
+                    'windows' => $employee->availabilityWindows
+                        ->filter(fn ($w): bool => $w->day_of_week?->value === $dow)
+                        ->values(),
+                ];
+            })
+            ->all();
+    }
+}

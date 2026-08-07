@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Casts\DateOnly;
 use App\Enums\RequestStatus;
 use App\Enums\RequestType;
 use Illuminate\Database\Eloquent\Builder;
@@ -32,8 +33,8 @@ class EmployeeRequest extends Model
         return [
             'request_type' => RequestType::class,
             'status' => RequestStatus::class,
-            'start_date' => 'date',
-            'end_date' => 'date',
+            'start_date' => DateOnly::class,
+            'end_date' => DateOnly::class,
         ];
     }
 

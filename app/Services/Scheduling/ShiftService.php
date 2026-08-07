@@ -88,6 +88,11 @@ class ShiftService
             'start_at' => $startUtc,
             'end_at' => $endUtc,
             'business_date' => $attributes['business_date'] ?? $this->businessDay->businessDate($storeId, $startUtc),
+            // Set explicitly rather than leaning on the column default. Left out
+            // of the insert, the row gets 'none' but the model handed back still
+            // holds null — and anything copying from that model (split() does)
+            // then writes that null over the default and hits the NOT NULL.
+            'repeat_rule' => $attributes['repeat_rule'] ?? 'none',
             // A new shift is always a draft. Nothing has been told about it yet.
             'publish_state' => PublishState::Draft,
             'availability_check' => $this->availabilityFor($employeeId, $storeId, $startUtc, $endUtc),
@@ -224,7 +229,7 @@ class ShiftService
                 'end_at' => $endUtc,
                 'unpaid_break_minutes' => 0,
                 'notes' => $shift->notes,
-                'repeat_rule' => $shift->repeat_rule,
+                'repeat_rule' => $shift->repeat_rule ?? 'none',
                 'repeat_until' => $shift->repeat_until,
                 'series_id' => $shift->series_id,
                 'split_group_id' => $shift->split_group_id,

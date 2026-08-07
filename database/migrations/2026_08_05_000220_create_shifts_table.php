@@ -26,7 +26,13 @@ return new class extends Migration {
             // NULL = an open shift: placed on the board before anyone is assigned.
             $table->foreignId('employee_id')->nullable()->constrained('employees')->restrictOnDelete();
             $table->foreignId('store_id')->constrained('stores')->restrictOnDelete();
-            $table->foreignId('position_id')->nullable()->constrained('positions')->restrictOnDelete();
+            // nullOnDelete, not restrict: positions are a PROJECTION of hiring
+            // events. Under restrict, a position removed upstream can never be
+            // deleted here once any shift referenced it — the handler throws,
+            // burns its five attempts and parks the event permanently. A
+            // position is descriptive on a shift, not load-bearing, so losing
+            // it is survivable in a way a stuck projection is not.
+            $table->foreignId('position_id')->nullable()->constrained('positions')->nullOnDelete();
 
             // The store-local day this shift belongs to. Stored, not derived: a
             // shift starting 22:00 belongs to the day it started, and deriving

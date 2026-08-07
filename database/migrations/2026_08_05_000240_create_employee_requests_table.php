@@ -38,7 +38,12 @@ return new class extends Migration {
     {
         Schema::create('employee_requests', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('employee_id')->constrained('employees')->cascadeOnDelete();
+            // restrictOnDelete, NOT cascade. employee_requests and their
+            // decision trail are SCHEDULING-OWNED; employees is a PROJECTION.
+            // Under cascade, rebuilding the projection would silently delete
+            // every time-off request and every decision ever recorded — the
+            // exact coupling the projection/owned split exists to prevent.
+            $table->foreignId('employee_id')->constrained('employees')->restrictOnDelete();
 
             $table->enum('request_type', [
                 'time_off',

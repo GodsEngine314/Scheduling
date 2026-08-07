@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Casts\DateOnly;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -20,7 +21,7 @@ class EmployeePosition extends Model
     protected function casts(): array
     {
         return [
-            'effective_date' => 'date',
+            'effective_date' => DateOnly::class,
         ];
     }
 
