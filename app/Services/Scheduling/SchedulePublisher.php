@@ -2,12 +2,15 @@
 
 namespace App\Services\Scheduling;
 
+use App\Enums\ActivityAction;
 use App\Enums\IntegrationEntityType;
 use App\Enums\IntegrationSystem;
 use App\Enums\PublishState;
 use App\Exceptions\IntegrationException;
+use App\Exceptions\SchedulingException;
 use App\Models\IntegrationIdentity;
 use App\Models\Shift;
+use App\Services\ActivityLogger;
 use App\Support\BusinessDay;
 use App\Support\Integrations\Humanity\HumanityClient;
 use Illuminate\Database\Eloquent\Builder;
@@ -50,6 +53,11 @@ class SchedulePublisher
         PublishState::Draft,
         PublishState::Queued,
         PublishState::Failed,
+        // Live in Humanity but unlocked for editing. It keeps its
+        // humanity_shift_id, so push() routes it to PUT rather than POST — and
+        // if nothing was actually changed the fingerprint still matches and it
+        // is reported 'unchanged' instead of costing a pointless request.
+        PublishState::Unlocked,
     ];
 
     /**
@@ -64,6 +72,7 @@ class SchedulePublisher
     public function __construct(
         private readonly HumanityClient $humanity,
         private readonly BusinessDay $businessDay,
+        private readonly ActivityLogger $activity,
     ) {}
 
     /**
@@ -170,6 +179,14 @@ class SchedulePublisher
         }
 
         if ($this->isUnchanged($shift, $this->fingerprint($state))) {
+            // Settle an unlocked-but-unedited shift back to published. Humanity
+            // is not touched — it already holds exactly this — but the row must
+            // stop being reported as pending, or pendingInRange() keeps
+            // returning it and the publish button's count never reaches zero.
+            if ($shift->publish_state === PublishState::Unlocked) {
+                $shift->forceFill(['publish_state' => PublishState::Published])->save();
+            }
+
             return 'unchanged';
         }
 
@@ -259,7 +276,53 @@ class SchedulePublisher
      *
      * @throws Throwable
      */
-    public function unpublish(Shift $shift, ?string $rule = null): Shift
+    /**
+     * Unlock a published shift so it can be edited. Humanity is NOT touched.
+     *
+     * This is the gate the editing workflow turns on: a published shift is
+     * locked, and every edit path refuses until this has been called. What it
+     * does is deliberately small — flip the state and leave everything else
+     * alone:
+     *
+     *   humanity_shift_id  KEPT. It is what makes the next publish a
+     *                      PUT /shifts/{id} instead of a second POST, which
+     *                      would leave the employee with two shifts.
+     *   payload_fingerprint KEPT. Unlocking is not itself a change. If the
+     *                      manager thinks better of it and edits nothing, the
+     *                      next publish matches the fingerprint and reports
+     *                      'unchanged' rather than spending a request. The
+     *                      first real edit nulls it (ShiftService::update).
+     *
+     * Employees keep seeing the last published version until the edit is
+     * re-published. A shift briefly out of date is better than one that
+     * disappears from somebody's week while a manager is mid-thought.
+     */
+    public function unpublish(Shift $shift): Shift
+    {
+        if (! $shift->publish_state?->isLive()) {
+            throw new SchedulingException(
+                "Shift #{$shift->id} is not published, so there is nothing to unpublish.",
+                ['shift_id' => $shift->id, 'publish_state' => $shift->publish_state?->value],
+            );
+        }
+
+        return DB::transaction(function () use ($shift): Shift {
+            $was = $shift->publish_state;
+
+            $shift->forceFill(['publish_state' => PublishState::Unlocked])->save();
+
+            $this->activity->shift($shift, ActivityAction::Unpublished, [
+                'publish_state' => ['from' => $was?->value, 'to' => PublishState::Unlocked->value],
+            ], [
+                'humanity_shift_id' => $shift->humanity_shift_id,
+                'note' => 'Still live in Humanity; the next publish sends a PUT.',
+            ]);
+
+            return $shift;
+        });
+    }
+
+    public function withdraw(Shift $shift, ?string $rule = null): Shift
     {
         $humanityShiftId = $shift->humanity_shift_id;
 
@@ -318,7 +381,6 @@ class SchedulePublisher
             // shift at the wrong hour to the manager reading it.
             'start_time' => $this->businessDay->toLocal($storeId, $shift->start_at)->format('Y-m-d H:i:s'),
             'end_time' => $this->businessDay->toLocal($storeId, $shift->end_at)->format('Y-m-d H:i:s'),
-            'break' => (int) $shift->unpaid_break_minutes,
             'notes' => $shift->notes,
             'location' => $this->externalId(IntegrationEntityType::Store, $storeId),
             'schedule' => $shift->position_id === null
@@ -412,7 +474,12 @@ class SchedulePublisher
     {
         return $shift->humanity_shift_id !== null
             && $shift->payload_fingerprint === $fingerprint
-            && $shift->publish_state === PublishState::Published;
+            // isLive(), not === Published. An UNLOCKED shift is also live in
+            // Humanity, and unlocking is not itself a change: a manager who
+            // unpublishes, thinks better of it and re-publishes must cost
+            // Humanity nothing. Requiring Published here sent a pointless PUT
+            // every time somebody changed their mind.
+            && (bool) $shift->publish_state?->isLive();
     }
 
     /**
@@ -468,7 +535,11 @@ class SchedulePublisher
 
     private function recordSuccess(Shift $shift, string $humanityShiftId, string $fingerprint): void
     {
-        DB::transaction(function () use ($shift, $humanityShiftId, $fingerprint): void {
+        // Was this the first POST or a PUT over an existing shift? Read before
+        // the write, because the state is about to become Published either way.
+        $wasLive = (bool) $shift->publish_state?->isLive();
+
+        DB::transaction(function () use ($shift, $humanityShiftId, $fingerprint, $wasLive): void {
             $shift->forceFill([
                 'humanity_shift_id' => $humanityShiftId,
                 'payload_fingerprint' => $fingerprint,
@@ -481,6 +552,13 @@ class SchedulePublisher
                 // only ever grows.
                 'publish_attempts' => 0,
             ])->save();
+
+            // The moment a shift went live, and by which verb. This is the line
+            // someone reads when asking "when did the employee first see this?"
+            $this->activity->shift($shift, ActivityAction::Published, [], [
+                'humanity_shift_id' => $humanityShiftId,
+                'method' => $wasLive ? 'PUT' : 'POST',
+            ]);
         });
     }
 

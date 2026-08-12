@@ -98,18 +98,18 @@ it('refuses a part that ends before it starts', function () {
     ))->toThrow(SchedulingException::class);
 });
 
-it('gives part 2 no break, so the gap is never paid', function () {
+it('never pays for the gap between the parts', function () {
     $part1 = unsplitShift();
-    $part1->forceFill(['unpaid_break_minutes' => 30])->save();
-    $before = $part1->fresh()->paidHours();
+    $before = $part1->paidHours();
 
     // A two-hour gap, then a two-hour block.
     $start = $part1->end_at->copy()->addHours(2);
     $part2 = $this->svc->split($part1->fresh(), $start, $start->copy()->addHours(2));
 
-    expect($part2->unpaid_break_minutes)->toBe(0)
-        ->and($part2->paidHours())->toBe(2.0)
-        // Part 1 keeps its own break; the gap adds nothing.
+    // Part 2 adds exactly its own two hours. The gap is not scheduled and there
+    // is no break field on a planned shift to mis-record it as — break time is
+    // TCP's, on work_segments.break_minutes.
+    expect($part2->paidHours())->toBe(2.0)
         ->and(round($part1->fresh()->paidHours() + $part2->paidHours(), 2))
         ->toBe(round($before + 2.0, 2));
 });
@@ -119,7 +119,6 @@ it('leaves part 1 alone when part 2 is created', function () {
     $before = [
         'start' => $part1->start_at->toIso8601String(),
         'end' => $part1->end_at->toIso8601String(),
-        'break' => $part1->unpaid_break_minutes,
         'business_date' => $part1->business_date->toDateString(),
     ];
 
@@ -132,7 +131,6 @@ it('leaves part 1 alone when part 2 is created', function () {
     // untouched, so punches already reconciled against it stay matched.
     expect($after->start_at->toIso8601String())->toBe($before['start'])
         ->and($after->end_at->toIso8601String())->toBe($before['end'])
-        ->and($after->unpaid_break_minutes)->toBe($before['break'])
         ->and($after->business_date->toDateString())->toBe($before['business_date']);
 });
 
@@ -157,10 +155,26 @@ it('checks each part against availability independently', function () {
         ->and($outside->availability_check->value)->toBe('outside_availability');
 });
 
-it('starts part 2 as a draft even when part 1 is already published', function () {
+it('refuses to split a published shift until it is unpublished', function () {
     $part1 = unsplitShift();
     $part1->forceFill([
         'publish_state' => 'published',
+        'humanity_shift_id' => 'HS-500',
+        'payload_fingerprint' => str_repeat('b', 64),
+    ])->save();
+
+    $start = $part1->end_at->copy()->addHours(2);
+
+    // A published shift is what employees are already planning around. Changing
+    // one has to be deliberate.
+    expect(fn () => $this->svc->split($part1->fresh(), $start, $start->copy()->addHour()))
+        ->toThrow(SchedulingException::class);
+});
+
+it('starts part 2 as a draft when part 1 is live but unlocked', function () {
+    $part1 = unsplitShift();
+    $part1->forceFill([
+        'publish_state' => 'unlocked',
         'humanity_shift_id' => 'HS-500',
         'payload_fingerprint' => str_repeat('b', 64),
     ])->save();
@@ -173,7 +187,9 @@ it('starts part 2 as a draft even when part 1 is already published', function ()
     expect($part2->publish_state->value)->toBe('draft')
         ->and($part2->humanity_shift_id)->toBeNull()
         ->and($part2->payload_fingerprint)->toBeNull()
-        ->and($part1->fresh()->publish_state->value)->toBe('published');
+        // Part 1 keeps its own live state and its Humanity id.
+        ->and($part1->fresh()->publish_state->value)->toBe('unlocked')
+        ->and($part1->fresh()->humanity_shift_id)->toBe('HS-500');
 });
 
 it('does not reuse the part number of a deleted part', function () {

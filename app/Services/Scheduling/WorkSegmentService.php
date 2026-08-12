@@ -2,12 +2,14 @@
 
 namespace App\Services\Scheduling;
 
+use App\Enums\ActivityAction;
 use App\Enums\MatchSource;
 use App\Enums\SegmentOrigin;
 use App\Enums\TcpSyncState;
 use App\Exceptions\SchedulingException;
 use App\Jobs\PushWorkSegmentToTcp;
 use App\Models\WorkSegment;
+use App\Services\ActivityLogger;
 use App\Support\BusinessDay;
 use Carbon\CarbonImmutable;
 use Carbon\CarbonInterface;
@@ -41,6 +43,7 @@ class WorkSegmentService
     public function __construct(
         private readonly BusinessDay $businessDay,
         private readonly ReconciliationService $reconciliation,
+        private readonly ActivityLogger $activity,
     ) {}
 
     /**
@@ -93,6 +96,7 @@ class WorkSegmentService
             ));
 
             $this->reconciliation->match($segment);
+            $this->activity->workSegment($segment, ActivityAction::Created, [], ['origin' => 'manual_create']);
             $this->pushToTcp($segment);
 
             return $segment;
@@ -121,69 +125,16 @@ class WorkSegmentService
                 'tcp_sync_state' => TcpSyncState::Pending,
             ])->save();
 
+            $this->activity->workSegment($segment, ActivityAction::Approved, [], [
+                'hours' => $segment->hours === null ? null : (float) $segment->hours,
+            ]);
+
             // "Approving Hours ... PUT /worksegments/{id}". An approval that
             // never reaches TCP means payroll pays from a number the timeclock
             // does not agree with.
             $this->pushToTcp($segment);
 
             return $segment;
-        });
-    }
-
-    /**
-     * Bulk approve. One bad id must not abort the batch, so this reports rather
-     * than throws — the caller shows the skipped rows and the manager deals
-     * with them.
-     *
-     * @param  array<int, int|string>  $ids
-     * @return array{approved: array<int, int>, skipped: array<int, array{id: int|string, reason: string}>}
-     */
-    public function approveMany(array $ids, ?int $userId = null): array
-    {
-        $ids = array_values(array_unique(array_map('intval', $ids)));
-
-        return DB::transaction(function () use ($ids, $userId): array {
-            $segments = WorkSegment::query()->whereKey($ids)->get()->keyBy('id');
-
-            $approved = [];
-            $skipped = [];
-
-            foreach ($ids as $id) {
-                $segment = $segments->get($id);
-
-                if ($segment === null) {
-                    $skipped[] = ['id' => $id, 'reason' => 'not_found'];
-
-                    continue;
-                }
-
-                if ($segment->time_out === null) {
-                    $skipped[] = ['id' => $id, 'reason' => 'open_punch'];
-
-                    continue;
-                }
-
-                if ($segment->manager_approval) {
-                    $skipped[] = ['id' => $id, 'reason' => 'already_approved'];
-
-                    continue;
-                }
-
-                $segment->forceFill([
-                    'manager_approval' => true,
-                    'approved_by_user_id' => $userId,
-                    'approved_at' => now(),
-                    'tcp_sync_state' => TcpSyncState::Pending,
-                ])->save();
-
-                // One job per row. A batch approval is still N separate PUTs
-                // to TCP, and one rejected row must not strand the others.
-                $this->pushToTcp($segment);
-
-                $approved[] = (int) $id;
-            }
-
-            return ['approved' => $approved, 'skipped' => $skipped];
         });
     }
 
@@ -226,7 +177,11 @@ class WorkSegmentService
             ]);
         }
 
-        return DB::transaction(function () use ($segment, $newIn, $newOut, $reapprove, $userId): WorkSegment {
+        // Read before the write, or the diff records the new value twice.
+        $wasIn = $segment->time_in?->toIso8601String();
+        $wasOut = $segment->time_out?->toIso8601String();
+
+        return DB::transaction(function () use ($segment, $newIn, $newOut, $reapprove, $userId, $wasIn, $wasOut): WorkSegment {
             $storeId = (int) $segment->store_id;
             $breakMinutes = (int) $segment->break_minutes;
 
@@ -248,6 +203,12 @@ class WorkSegmentService
             // "Change Shift ... PUT /worksegments/{id} but with parameters of
             // timeIn and timeOut."
             $segment->forceFill(['tcp_sync_state' => TcpSyncState::Pending])->save();
+
+            $this->activity->workSegment($segment, ActivityAction::Corrected, [
+                'time_in' => ['from' => $wasIn, 'to' => $segment->time_in?->toIso8601String()],
+                'time_out' => ['from' => $wasOut, 'to' => $segment->time_out?->toIso8601String()],
+            ], ['reapproved' => $reapprove]);
+
             $this->pushToTcp($segment);
 
             return $segment;
@@ -259,6 +220,10 @@ class WorkSegmentService
     {
         return (bool) DB::transaction(function () use ($segment): bool {
             $deleted = (bool) $segment->delete();
+
+            if ($deleted) {
+                $this->activity->workSegment($segment, ActivityAction::Deleted);
+            }
 
             // "Deleting Shifts ... DEL /worksegments/{id}". The job reads the
             // row withTrashed and sends the delete; a row TCP never saw is a

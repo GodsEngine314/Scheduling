@@ -332,19 +332,20 @@ it('estimates the labour cost of a planned shift', function () {
         'employee_id' => $employee, 'base_pay' => 17.50, 'performance_pay' => 1.50, 'effective_date' => '2026-07-01',
     ]);
 
-    // 13:00 to 21:00 with a 30 minute unpaid break = 7.5 paid hours.
-    $shift = makeShift(['employee_id' => $employee, 'unpaid_break_minutes' => 30]);
+    // 13:00 to 21:00 = 8 paid hours. A planned shift carries no break at all:
+    // break time is TCP's, and it arrives on work_segments.break_minutes.
+    $shift = makeShift(['employee_id' => $employee]);
     $row = DB::table('shifts')->find($shift);
 
-    $paidHours = ((strtotime($row->end_at) - strtotime($row->start_at)) / 3600) - ($row->unpaid_break_minutes / 60);
+    $paidHours = (strtotime($row->end_at) - strtotime($row->start_at)) / 3600;
     $rate = DB::table('employee_pay_histories')
         ->where('employee_id', $employee)
         ->where('effective_date', '<=', $row->business_date)
         ->orderByDesc('effective_date')
         ->first();
 
-    expect($paidHours)->toBe(7.5)
-        ->and(round($paidHours * ((float) $rate->base_pay + (float) $rate->performance_pay), 2))->toBe(142.50);
+    expect((float) $paidHours)->toBe(8.0)
+        ->and(round($paidHours * ((float) $rate->base_pay + (float) $rate->performance_pay), 2))->toBe(152.00);
 });
 
 it('surfaces approved time off when a shift is placed on those dates', function () {
@@ -546,11 +547,11 @@ it('does not count the gap between split parts as paid time', function () {
         'start_at' => '2026-08-10 21:00:00', 'end_at' => '2026-08-11 01:00:00']);
 
     $paid = (float) DB::table('shifts')->where('split_group_id', $group)->get()
-        ->sum(fn ($s) => (strtotime($s->end_at) - strtotime($s->start_at)) / 3600
-            - $s->unpaid_break_minutes / 60);
+        ->sum(fn ($s) => (strtotime($s->end_at) - strtotime($s->start_at)) / 3600);
 
-    // 3 hours plus 4 hours. The 3-hour gap is not paid, and it is not a break
-    // either — storing it as unpaid_break_minutes would have made this 10.
+    // 3 hours plus 4 hours. The 3-hour gap between the parts is simply not
+    // scheduled, so it cannot be paid: there is no break field to mis-file it
+    // into any more.
     expect($paid)->toBe(7.0);
 });
 

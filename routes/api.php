@@ -55,6 +55,10 @@ Route::put('shifts/{shift}', [ShiftController::class, 'update'])
 Route::delete('shifts/{shift}', [ShiftController::class, 'destroy'])
     ->whereNumber('shift')
     ->name('api.shifts.destroy');
+// Declared ahead of the {shift} routes so 'publish' can never be read as an id.
+Route::post('shifts/publish', [ShiftController::class, 'publish'])->name('api.shifts.publish');
+Route::post('shifts/{shift}/unpublish', [ShiftController::class, 'unpublish'])->name('api.shifts.unpublish');
+
 Route::post('shifts/{shift}/split', [ShiftController::class, 'split'])
     ->whereNumber('shift')
     ->name('api.shifts.split');
@@ -66,10 +70,11 @@ Route::get('work-segments', [WorkSegmentController::class, 'index'])
     ->name('api.work-segments.index');
 Route::post('work-segments', [WorkSegmentController::class, 'store'])
     ->name('api.work-segments.store');
-// Declared ahead of the {workSegment} routes so 'approve' can never be read as
-// an id, whatever verbs get added to them later.
-Route::post('work-segments/approve', [WorkSegmentController::class, 'approve'])
+// Per-segment approval. There is no bulk approve by design: each employee's
+// hours are signed off individually.
+Route::post('work-segments/{workSegment}/approve', [WorkSegmentController::class, 'approve'])
     ->name('api.work-segments.approve');
+
 Route::put('work-segments/{workSegment}', [WorkSegmentController::class, 'update'])
     ->whereNumber('workSegment')
     ->name('api.work-segments.update');

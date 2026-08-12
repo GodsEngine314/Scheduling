@@ -3,7 +3,10 @@
 namespace App\Services\Scheduling;
 
 use App\Exceptions\SchedulingException;
+use App\Enums\ActivityAction;
+use App\Enums\ActivitySubject;
 use App\Models\WorkSegment;
+use App\Services\ActivityLogger;
 use Illuminate\Support\Collection;
 
 /**
@@ -25,6 +28,8 @@ use Illuminate\Support\Collection;
  */
 class DayCloseService
 {
+    public function __construct(private readonly ActivityLogger $activity) {}
+
     /**
      * @return array{
      *     store_id: int,
@@ -88,10 +93,21 @@ class DayCloseService
             throw SchedulingException::dayNotClosable($storeId, $businessDate, $result['blockers']);
         }
 
-        return array_merge($result, [
+        $closed = array_merge($result, [
             'closed_at' => now()->toIso8601String(),
             'closed_by_user_id' => $userId,
         ]);
+
+        // subject_id stays null: a day close is about a date, not a row.
+        $this->activity->record(
+            ActivitySubject::Day,
+            ActivityAction::DayClosed,
+            null,
+            $storeId,
+            $businessDate,
+        );
+
+        return $closed;
     }
 
     /**

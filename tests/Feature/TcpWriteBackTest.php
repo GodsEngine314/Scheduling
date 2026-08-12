@@ -118,13 +118,17 @@ it('queues a TCP delete when a segment is removed', function () {
         fn (PushWorkSegmentToTcp $job): bool => $job->workSegmentId === $segment->id);
 });
 
-it('approves a batch as one TCP push per row, so one rejection cannot strand the rest', function () {
+it('pushes every individually approved segment to TCP', function () {
     Queue::fake();
-    $ids = WorkSegment::whereNotNull('time_out')->where('manager_approval', false)->pluck('id')->all();
+    $segments = WorkSegment::whereNotNull('time_out')->where('manager_approval', false)->get();
 
-    app(WorkSegmentService::class)->approveMany($ids, 1);
+    // There is no bulk approval: each employee's hours are approved on their
+    // own, and each one is its own PUT, so a rejection strands nobody else.
+    foreach ($segments as $segment) {
+        app(WorkSegmentService::class)->approve($segment, 1);
+    }
 
-    Queue::assertPushed(PushWorkSegmentToTcp::class, count($ids));
+    Queue::assertPushed(PushWorkSegmentToTcp::class, $segments->count());
 });
 
 // ── employees → TCP ─────────────────────────────────────────────────────
@@ -270,7 +274,7 @@ it('sends nothing to Humanity when a shift is created, edited or deleted', funct
     Http::assertNothingSent();
 });
 
-it('nulls the fingerprint when a published shift is edited, so the next publish re-sends it', function () {
+it('refuses to edit a published shift, then re-sends it as a PUT once unpublished', function () {
     Http::fake(['*' => Http::response([], 200)]);
 
     $shift = Shift::whereNotNull('employee_id')->firstOrFail();
@@ -279,6 +283,25 @@ it('nulls the fingerprint when a published shift is edited, so the next publish 
         'humanity_shift_id' => 'HS-9',
         'payload_fingerprint' => str_repeat('a', 64),
     ])->save();
+
+    // Locked. The edit bounces rather than silently diverging from what
+    // employees can already see in Humanity.
+    $this->put("/board/shifts/{$shift->id}", [
+        'date' => $this->today,
+        'employee_id' => $shift->employee_id,
+        'start' => '15:00',
+        'end' => '19:00',
+    ])->assertRedirect();
+
+    expect(session('err'))->toContain('published')
+        ->and($shift->fresh()->payload_fingerprint)->not->toBeNull();
+
+    // Unpublishing keeps the shift in Humanity AND keeps its id — that is what
+    // makes the next publish a PUT instead of a duplicate POST.
+    $this->post("/board/shifts/{$shift->id}/unpublish")->assertRedirect();
+
+    expect($shift->fresh()->publish_state->value)->toBe('unlocked')
+        ->and($shift->fresh()->humanity_shift_id)->toBe('HS-9');
 
     $this->put("/board/shifts/{$shift->id}", [
         'date' => $this->today,

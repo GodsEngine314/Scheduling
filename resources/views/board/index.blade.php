@@ -66,6 +66,11 @@
     <div class="s">{{ $openCount ? $openCount.' still clocked in' : 'all punched out' }}</div>
   </div>
 
+  @include('board._publish', [
+      'storeId' => $storeId, 'from' => $date, 'to' => $date,
+      'publishable' => $publishable, 'label' => 'this day',
+  ])
+
   <div class="card pad grow" style="border-left:4px solid {{ $board['day_close']['closable'] ? 'var(--ok)' : 'var(--crit)' }}">
     <div class="lbl">Day close</div>
     @if ($board['day_close']['closable'])
@@ -84,12 +89,6 @@
       <input type="hidden" name="store_id" value="{{ $storeId }}">
       <input type="hidden" name="date" value="{{ $date }}">
       <button class="primary">Close the day</button>
-    </form>
-    <form method="POST" action="{{ route('board.segments.approve-all') }}" class="inline">
-      @csrf
-      <input type="hidden" name="store_id" value="{{ $storeId }}">
-      <input type="hidden" name="date" value="{{ $date }}">
-      <button>Approve all hours</button>
     </form>
   </div>
 </div>
@@ -116,7 +115,6 @@
     </label>
     <label class="f"><span class="lbl">Start</span><input type="time" name="start" value="17:00" required></label>
     <label class="f"><span class="lbl">End</span><input type="time" name="end" value="21:00" required></label>
-    <label class="f"><span class="lbl">Break min</span><input class="num" type="number" name="unpaid_break_minutes" value="0" min="0" max="240"></label>
     <button class="primary">Add shift</button>
   </form>
   {{-- A sibling, never nested: a form inside a form is dropped by the parser
@@ -266,7 +264,7 @@
     <table>
       <caption>shifts <em style="font-style:normal;color:var(--text-3);text-transform:none;letter-spacing:0">planned · scheduling-owned</em></caption>
       <thead><tr>
-        <th>id</th><th>employee</th><th>local</th><th>break</th><th>paid h</th><th>cost</th>
+        <th>id</th><th>employee</th><th>local</th><th>paid h</th><th>cost</th>
         <th>availability</th><th>split</th><th>publish</th><th>warnings</th><th>actions</th>
       </tr></thead>
       <tbody>
@@ -280,7 +278,6 @@
           <td class="k">#{{ $s->id }}</td>
           <td>{{ $s->employee?->fullName() ?? '—' }}</td>
           <td>{{ $hhmm($ms) }}→{{ $hhmm($me) }}</td>
-          <td>{{ $s->unpaid_break_minutes }}m</td>
           <td>{{ number_format($s->paidHours(), 2) }}</td>
           <td>{{ $s->employee_id && $rate ? '$'.number_format($s->paidHours() * $rate, 2) : '—' }}</td>
           <td><span class="chip {{ $chk === 'ok' ? 'ok' : ($chk === 'unknown' ? 'neutral' : 'crit') }}">{{ $chk }}</span></td>
@@ -292,7 +289,15 @@
             @empty — @endforelse
           </td>
           <td>
-            <button class="mini" type="button" onclick="document.getElementById('edit-shift-{{ $s->id }}').hidden = !document.getElementById('edit-shift-{{ $s->id }}').hidden">edit</button>
+            @if ($s->publish_state?->isLocked())
+              {{-- Published and locked. Editing is refused until this is
+                   pressed; Humanity keeps the shift either way. --}}
+              <form method="POST" action="{{ route('board.shifts.unpublish', $s) }}" class="inline">
+                @csrf<button class="mini">unpublish to edit</button>
+              </form>
+            @else
+              <button class="mini" type="button" onclick="document.getElementById('edit-shift-{{ $s->id }}').hidden = !document.getElementById('edit-shift-{{ $s->id }}').hidden">edit</button>
+            @endif
             <button class="mini" type="button"
                     data-split-url="{{ route('board.shifts.split', $s) }}"
                     data-shift="{{ $s->id }}"
@@ -333,8 +338,6 @@
                 <input type="time" name="start" value="{{ str_replace('⁺', '', $hhmm($mins($s->start_at))) }}" required></label>
               <label class="f"><span class="lbl">End</span>
                 <input type="time" name="end" value="{{ str_replace('⁺', '', $hhmm($mins($s->end_at))) }}" required></label>
-              <label class="f"><span class="lbl">Break min</span>
-                <input class="num" type="number" name="unpaid_break_minutes" value="{{ $s->unpaid_break_minutes }}" min="0" max="240"></label>
               <label class="f" style="flex:1 1 200px"><span class="lbl">Notes</span>
                 <input type="text" name="notes" value="{{ $s->notes }}" style="width:100%"></label>
               <button class="primary">Save shift</button>
@@ -449,12 +452,27 @@
           </td>
           <td style="white-space:normal;max-width:280px">{{ $q->description }}</td>
           <td>
-            @foreach (['approved', 'denied', 'cancelled'] as $d)
-              <form method="POST" action="{{ route('board.requests.decide', $q) }}" class="inline">
-                @csrf<input type="hidden" name="decision" value="{{ $d }}">
-                <button class="mini">{{ $d }}</button>
-              </form>
-            @endforeach
+            @if ($q->status?->value === 'pending')
+              {{-- Undecided: the three ways to settle it. --}}
+              @foreach (['approved', 'denied', 'cancelled'] as $d)
+                <form method="POST" action="{{ route('board.requests.decide', $q) }}" class="inline">
+                  @csrf<input type="hidden" name="decision" value="{{ $d }}">
+                  <button class="mini">{{ $d }}</button>
+                </form>
+              @endforeach
+            @else
+              {{-- Already settled. One button, so changing your mind is a
+                   deliberate act rather than a mis-click on a row of three.
+                   The decision is not overwritten: a new row is appended and
+                   the old one stays in the trail. --}}
+              <button class="mini" type="button"
+                      onclick="openDecision(this)"
+                      data-url="{{ route('board.requests.decide', $q) }}"
+                      data-request="{{ $q->id }}"
+                      data-who="{{ $q->employee?->fullName() }}"
+                      data-current="{{ $q->status?->value }}"
+                      data-count="{{ $q->decisions->count() }}">edit decision</button>
+            @endif
           </td>
         </tr>
       @empty
@@ -464,6 +482,56 @@
     </table>
   </div>
 </div>
+
+{{-- ── decision dialog ───────────────────────────────────────────────
+     Shared by every decided request, repopulated from the button. --}}
+<dialog id="decision-dialog" class="card" style="padding:0;border:1px solid var(--line-2);max-width:480px">
+  <form method="POST" id="decision-form" style="margin:0;padding:16px;display:flex;flex-direction:column;gap:12px">
+    @csrf
+    <div>
+      <div class="lbl">Change a decision</div>
+      <div style="font-family:var(--mono);font-size:13px;font-weight:700;margin-top:3px" id="decision-title">—</div>
+      <div class="note" style="margin-top:2px" id="decision-current">—</div>
+    </div>
+
+    <label class="f"><span class="lbl">New decision</span>
+      <select name="decision" id="decision-value">
+        <option value="approved">approved</option>
+        <option value="denied">denied</option>
+        <option value="cancelled">cancelled</option>
+      </select>
+    </label>
+
+    <label class="f"><span class="lbl">Why (optional)</span>
+      <input type="text" name="notes" id="decision-notes" placeholder="cover fell through" style="width:100%">
+    </label>
+
+    <p class="note" style="margin:0">
+      The previous decision is <strong>kept</strong>. This appends a new row to the
+      trail, so a reversal stays visible — a status column that overwrote itself
+      would lose the fact that it was ever approved.
+    </p>
+
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button type="button" onclick="document.getElementById('decision-dialog').close()">Cancel</button>
+      <button class="primary" type="submit">Record decision</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+  function openDecision(btn) {
+    const dlg = document.getElementById('decision-dialog');
+    document.getElementById('decision-form').action = btn.dataset.url;
+    document.getElementById('decision-title').textContent =
+      btn.dataset.who + ' · request #' + btn.dataset.request;
+    document.getElementById('decision-current').textContent =
+      'Currently ' + btn.dataset.current + ', after ' + btn.dataset.count + ' decision(s).';
+    document.getElementById('decision-value').value = btn.dataset.current;
+    document.getElementById('decision-notes').value = '';
+    dlg.showModal();
+  }
+</script>
 
 {{-- ── split dialog ──────────────────────────────────────────────────
      One dialog for every row, repopulated from the button that opened it.
@@ -492,7 +560,7 @@
 
     <p class="note" style="margin:0">
       Two rows, never one row with a hole in it. The gap between the parts is
-      <strong>unpaid and is not a break</strong> — part 2 starts with no break of its own,
+      <strong>unpaid</strong>, and there is no break field on a planned shift to mis-record it as,
       and each part is checked against availability separately.
     </p>
 

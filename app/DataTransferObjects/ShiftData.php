@@ -13,7 +13,7 @@ namespace App\DataTransferObjects;
  *
  * One instance is one employee working one continuous block, matching one row.
  * An open shift has a null employeeId; a split shift is two instances sharing
- * a splitGroupId, and the gap between them is NOT unpaidBreakMinutes — a break
+ * a splitGroupId, and the gap between them is unpaid but is not a break
  * is time inside a block, a split gap is time between two of them.
  */
 final readonly class ShiftData
@@ -31,7 +31,6 @@ final readonly class ShiftData
         public string $endAt,
         public ?int $employeeId = null,
         public ?int $positionId = null,
-        public int $unpaidBreakMinutes = 0,
         public ?string $notes = null,
         public string $repeatRule = 'none',
         public ?string $repeatUntil = null,
@@ -60,7 +59,6 @@ final readonly class ShiftData
             'business_date' => $this->businessDate,
             'start_at' => $this->startAt,
             'end_at' => $this->endAt,
-            'unpaid_break_minutes' => $this->unpaidBreakMinutes,
             'notes' => $this->notes,
             'repeat_rule' => $this->repeatRule,
             'repeat_until' => $this->repeatUntil,

@@ -62,7 +62,6 @@ class ShiftStoreRequest extends FormRequest
             'start_at' => ['required_without:start_time', 'required_with:end_at', 'nullable', 'date'],
             'end_at' => ['required_without:end_time', 'required_with:start_at', 'nullable', 'date', 'after:start_at'],
 
-            'unpaid_break_minutes' => ['sometimes', 'integer', 'min:0', 'max:1440'],
             'notes' => ['nullable', 'string', 'max:2000'],
 
             // Figure 22's 15 repeat values are unconfirmed, which is why the
@@ -88,7 +87,6 @@ class ShiftStoreRequest extends FormRequest
             'employee_id',
             'position_id',
             'business_date',
-            'unpaid_break_minutes',
             'notes',
             'repeat_rule',
             'repeat_until',

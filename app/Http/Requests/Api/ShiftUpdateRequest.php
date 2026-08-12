@@ -45,7 +45,6 @@ class ShiftUpdateRequest extends FormRequest
             'start_at' => ['sometimes', 'required_with:end_at', 'date'],
             'end_at' => ['sometimes', 'required_with:start_at', 'date', 'after:start_at'],
 
-            'unpaid_break_minutes' => ['sometimes', 'integer', 'min:0', 'max:1440'],
             'notes' => ['sometimes', 'nullable', 'string', 'max:2000'],
             'repeat_rule' => ['sometimes', 'string', 'max:32'],
             'repeat_until' => ['sometimes', 'nullable', 'date_format:Y-m-d'],
@@ -66,7 +65,6 @@ class ShiftUpdateRequest extends FormRequest
             'employee_id',
             'position_id',
             'business_date',
-            'unpaid_break_minutes',
             'notes',
             'repeat_rule',
             'repeat_until',

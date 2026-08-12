@@ -63,7 +63,6 @@ class ShiftResource extends JsonResource
             'business_date' => $this->business_date?->toDateString(),
             'start_at' => $this->start_at?->toIso8601String(),
             'end_at' => $this->end_at?->toIso8601String(),
-            'unpaid_break_minutes' => (int) $this->unpaid_break_minutes,
             'paid_hours' => $this->paidHours(),
 
             'notes' => $this->notes,

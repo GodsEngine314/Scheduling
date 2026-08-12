@@ -126,7 +126,7 @@ class DemoSeeder extends Seeder
             $benShift = $shifts->create([
                 'store_id' => self::STORE_ID, 'employee_id' => $ben->id, 'position_id' => $driver->id,
                 'start_at_local' => "{$today} 16:00:00", 'end_at_local' => "{$today} 22:00:00",
-                'unpaid_break_minutes' => 30, 'created_by_user_id' => $manager->id,
+                'created_by_user_id' => $manager->id,
             ]);
 
             // Crosses midnight, inside Cleo's wrapping window. The end is the

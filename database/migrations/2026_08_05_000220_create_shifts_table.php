@@ -41,7 +41,6 @@ return new class extends Migration {
 
             $table->dateTime('start_at'); // UTC
             $table->dateTime('end_at');   // UTC
-            $table->unsignedSmallInteger('unpaid_break_minutes')->default(0);
             $table->text('notes')->nullable();
 
             // Figure 22 lists 15 repeat values. Kept as a validated string
@@ -67,13 +66,20 @@ return new class extends Migration {
             // draws the parts as one assignment, has to know.
             //
             // The gap between parts is implied by part 1's end_at and part 2's
-            // start_at, and is NOT unpaid_break_minutes: a break is time inside
-            // one block, a split gap is time between two of them. Conflating
-            // them would inflate the paid hours of every split shift.
+            // start_at. A planned shift carries no break at all: break time is
+            // TCP's to report, and it arrives on work_segments.break_minutes
+            // from GET /worksegments. Planning one here would be guessing at a
+            // number the timeclock is going to overwrite anyway.
             $table->ulid('split_group_id')->nullable();
             $table->unsignedTinyInteger('split_part')->nullable();
 
-            $table->enum('publish_state', ['draft', 'queued', 'published', 'failed', 'unpublished'])->default('draft');
+            // 'unlocked' is published-but-editable: Humanity still holds the
+            // shift and humanity_shift_id is kept, so the next publish sends a
+            // PUT rather than creating a duplicate. 'unpublished' is the
+            // stronger thing — withdrawn from Humanity altogether.
+            $table->enum('publish_state', [
+                'draft', 'queued', 'published', 'unlocked', 'failed', 'unpublished',
+            ])->default('draft');
             $table->string('humanity_shift_id', 64)->nullable()->unique();
 
             // SHA-256 of the payload Humanity last accepted. Re-publishing

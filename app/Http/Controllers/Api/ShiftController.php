@@ -10,6 +10,7 @@ use App\Http\Requests\Api\ShiftUpdateRequest;
 use App\Http\Resources\ShiftResource;
 use App\Models\Shift;
 use App\Services\Scheduling\LaborCostEstimator;
+use App\Services\Scheduling\SchedulePublisher;
 use App\Services\Scheduling\ShiftService;
 use App\Support\BusinessDay;
 use Illuminate\Http\JsonResponse;
@@ -37,6 +38,7 @@ class ShiftController extends ApiController
 {
     public function __construct(
         private readonly ShiftService $shifts,
+        private readonly SchedulePublisher $publisher,
         private readonly LaborCostEstimator $costs,
         private readonly BusinessDay $businessDay,
     ) {}
@@ -107,6 +109,42 @@ class ShiftController extends ApiController
      * 11:00-14:00 becomes that plus 17:00-21:00. Returns the NEW part, 201,
      * carrying the split_group_id that ties it to the first.
      */
+    /**
+     * Push a date range to Humanity.
+     *
+     * The ONLY thing on either surface that talks to Humanity. Everything else
+     * builds the schedule locally, because a POST to Humanity is live the
+     * instant it lands.
+     *
+     * Idempotent: a shift whose payload_fingerprint still matches is reported
+     * 'unchanged' and costs no request, so calling this twice is safe.
+     */
+    public function publish(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'store' => ['required', 'integer', 'exists:stores,id'],
+            'from' => ['required', 'date_format:Y-m-d'],
+            'to' => ['required', 'date_format:Y-m-d', 'after_or_equal:from'],
+        ]);
+
+        return $this->attempt(fn (): JsonResponse => response()->json([
+            'data' => $this->publisher->publishRange((int) $data['store'], $data['from'], $data['to']),
+        ]));
+    }
+
+    /**
+     * Unlock a published shift for editing. Humanity is not touched.
+     *
+     * The shift keeps its humanity_shift_id, so the next publish sends a PUT.
+     * Employees keep seeing the last published version in the meantime.
+     */
+    public function unpublish(Request $request, Shift $shift): JsonResponse
+    {
+        return $this->attempt(function () use ($request, $shift): JsonResponse {
+            return $this->single($this->publisher->unpublish($shift), $request)->response();
+        });
+    }
+
     public function split(ShiftSplitRequest $request, Shift $shift): JsonResponse
     {
         return $this->attempt(function () use ($request, $shift): JsonResponse {

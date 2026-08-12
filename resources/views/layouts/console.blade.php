@@ -62,6 +62,35 @@
   input.tiny{width:50px;padding:1px 4px;font-size:10px;min-height:0}
   dialog{background:var(--surface);color:var(--text);border-radius:8px}
   dialog::backdrop{background:rgba(0,0,0,.45)}
+
+  /* week grid */
+  table.week{table-layout:fixed;min-width:1000px}
+  table.week th{padding:5px 8px}
+  td.wk-name,th.wk-name{width:150px;white-space:normal}
+  .wk-name .n{font-family:var(--mono);font-size:11.5px;font-weight:700;color:var(--text)}
+  .wk-name .d{font-family:var(--mono);font-size:9.5px;color:var(--text-3)}
+  td.wk-cell{vertical-align:top;height:74px;padding:4px;background:var(--sunken);
+    border:1px solid var(--line);white-space:normal}
+  td.wk-cell.over{background:var(--planned-soft);border-color:var(--planned);border-style:dashed}
+  .chip-shift{display:block;margin-bottom:3px;padding:3px 5px;border-radius:4px;cursor:grab;
+    background:var(--planned-soft);border:1px solid var(--planned);color:var(--planned-ink);
+    font-family:var(--mono);font-size:9.5px;line-height:1.35}
+  .chip-shift:active{cursor:grabbing}
+  .chip-shift.dragging{opacity:.4}
+  .chip-shift.bad{border-style:dashed;border-color:var(--crit)}
+  .chip-shift.locked{cursor:not-allowed;background:var(--surface-2);border-style:dotted}
+  .chip-shift.published{border-style:solid;border-color:var(--ok);color:var(--actual-ink);
+    background:var(--ok-soft)}
+  .chip-shift .t{display:block;font-weight:700}
+  .chip-shift .m{display:block;color:var(--text-3)}
+
+  .topbar{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;justify-content:space-between}
+  .topbar-nav{display:flex;gap:4px}
+  .topbar-nav a{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.03em;
+    text-decoration:none;color:var(--text-2);padding:5px 10px;border-radius:4px;
+    border:1px solid transparent}
+  .topbar-nav a:hover{background:var(--surface-2);border-color:var(--line-2)}
+  .topbar-nav a.on{background:var(--planned-soft);color:var(--planned-ink);border-color:var(--planned)}
   button.danger:hover{border-color:var(--crit);color:var(--crit)}
 
   .flash{border-radius:6px;padding:9px 12px;font-family:var(--mono);font-size:11.5px;
@@ -130,6 +159,42 @@
 </head>
 <body>
 <div class="wrap">
+
+  {{-- ── who is acting ──────────────────────────────────────────────────
+       Not a login. It records intent and restricts nothing — every route in
+       this service is still open — but an audit trail that cannot name an
+       actor is worthless, and several managers share one schedule. --}}
+  @php
+      $acting = app(\App\Support\ActingUser::class)->current();
+      $consoleUsers = \App\Models\User::query()->orderBy('name')->get(['id', 'name']);
+  @endphp
+  <div class="card pad topbar">
+    <nav class="topbar-nav">
+      <a href="{{ route('board') }}" class="{{ request()->routeIs('board') ? 'on' : '' }}">Day</a>
+      <a href="{{ route('board.week') }}" class="{{ request()->routeIs('board.week') ? 'on' : '' }}">Week</a>
+      <a href="{{ route('board.activity') }}" class="{{ request()->routeIs('board.activity') ? 'on' : '' }}">Activity</a>
+    </nav>
+
+    <form method="POST" action="{{ route('acting-user') }}" class="ctl" style="gap:8px;align-items:center">
+      @csrf
+      <span class="lbl">Acting as</span>
+      <select name="user_id" onchange="this.form.submit()">
+        <option value="">— nobody —</option>
+        @foreach ($consoleUsers as $u)
+          <option value="{{ $u->id }}" @selected($acting?->id === $u->id)>{{ $u->name }}</option>
+        @endforeach
+      </select>
+      <noscript><button class="mini">Set</button></noscript>
+      <span class="note" style="font-size:10.5px">
+        @if ($acting === null)
+          <span style="color:var(--warn)">Nothing you do will be attributed.</span>
+        @else
+          Recorded on every change. <strong>Not a login</strong> — it restricts nothing.
+        @endif
+      </span>
+    </form>
+  </div>
+
   @if (session('ok'))   <div class="flash ok">{{ session('ok') }}</div>   @endif
   @if (session('err'))  <div class="flash err">{{ session('err') }}</div> @endif
   @if ($errors->any())

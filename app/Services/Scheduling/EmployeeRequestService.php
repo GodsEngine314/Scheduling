@@ -2,6 +2,8 @@
 
 namespace App\Services\Scheduling;
 
+use App\Enums\ActivityAction;
+use App\Enums\ActivitySubject;
 use App\Enums\RequestDecision;
 use App\Enums\RequestStatus;
 use App\Enums\RequestType;
@@ -24,6 +26,8 @@ use Illuminate\Support\Facades\DB;
  */
 class EmployeeRequestService
 {
+    public function __construct(private readonly \App\Services\ActivityLogger $activity) {}
+
     private const CREATABLE = [
         'employee_id',
         'request_type',
@@ -87,7 +91,12 @@ class EmployeeRequestService
         ?int $userId = null,
         ?string $notes = null,
     ): EmployeeRequestDecision {
-        return DB::transaction(function () use ($request, $decision, $userId, $notes): EmployeeRequestDecision {
+        // How many decisions came before this one. Revision 2+ is a reversal,
+        // which is the whole reason the decisions table is append-only.
+        $revision = $request->decisions()->count() + 1;
+        $was = $request->status?->value;
+
+        return DB::transaction(function () use ($request, $decision, $userId, $notes, $was, $revision): EmployeeRequestDecision {
             $row = EmployeeRequestDecision::query()->create([
                 'employee_request_id' => $request->id,
                 'user_id' => $userId,
@@ -99,6 +108,18 @@ class EmployeeRequestService
             ]);
 
             $request->forceFill(['status' => $decision->toRequestStatus()])->save();
+
+            // Recorded as a change, not a first decision: re-deciding is normal
+            // here, and the interesting line in the log is the reversal.
+            $this->activity->record(
+                ActivitySubject::EmployeeRequest,
+                ActivityAction::Decided,
+                (int) $request->id,
+                $request->store_id === null ? null : (int) $request->store_id,
+                $request->start_date,
+                $was === null ? [] : ['status' => ['from' => $was, 'to' => $decision->toRequestStatus()->value]],
+                ['decision' => $decision->value, 'notes' => $notes, 'revision' => $revision],
+            );
 
             return $row;
         });

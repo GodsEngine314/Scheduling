@@ -18,11 +18,25 @@ use Illuminate\Support\Facades\Route;
 
 Route::redirect('/', '/board');
 
+// Who is making the change. Not a login — see App\Support\ActingUser.
+Route::post('/acting-user', [BoardController::class, 'setActingUser'])->name('acting-user');
+
 Route::get('/board', [BoardController::class, 'index'])->name('board');
+Route::get('/board/week', [BoardController::class, 'week'])->name('board.week');
+Route::get('/board/activity', [BoardController::class, 'activity'])->name('board.activity');
 
 Route::post('/board/shifts', [BoardController::class, 'storeShift'])->name('board.shifts.store');
 Route::put('/board/shifts/{shift}', [BoardController::class, 'updateShift'])->name('board.shifts.update');
 Route::post('/board/shifts/{shift}/split', [BoardController::class, 'splitShift'])->name('board.shifts.split');
+
+// Drag and drop targets. JSON in, JSON out — the grid posts and reloads.
+Route::post('/board/shifts/{shift}/move', [BoardController::class, 'moveShift'])->name('board.shifts.move');
+Route::post('/board/shifts/{shift}/copy', [BoardController::class, 'copyShift'])->name('board.shifts.copy');
+// Publish the visible range to Humanity, and unlock one shift for editing.
+// Nothing reaches Humanity until the first of these is pressed.
+Route::post('/board/publish', [BoardController::class, 'publish'])->name('board.publish');
+Route::post('/board/shifts/{shift}/unpublish', [BoardController::class, 'unpublishShift'])->name('board.shifts.unpublish');
+
 Route::post('/board/shifts/{shift}/punch-in', [BoardController::class, 'punchIn'])->name('board.shifts.punch-in');
 Route::delete('/board/shifts/{shift}', [BoardController::class, 'destroyShift'])->name('board.shifts.destroy');
 
@@ -30,7 +44,6 @@ Route::post('/board/segments/{segment}/punch-out', [BoardController::class, 'pun
 Route::put('/board/segments/{segment}', [BoardController::class, 'updateSegment'])->name('board.segments.update');
 Route::post('/board/segments/{segment}/approve', [BoardController::class, 'approveSegment'])->name('board.segments.approve');
 Route::delete('/board/segments/{segment}', [BoardController::class, 'destroySegment'])->name('board.segments.destroy');
-Route::post('/board/segments/approve-all', [BoardController::class, 'approveAll'])->name('board.segments.approve-all');
 
 Route::post('/board/day-close', [BoardController::class, 'closeDay'])->name('board.day-close');
 Route::post('/board/requests/{employeeRequest}/decide', [BoardController::class, 'decideRequest'])->name('board.requests.decide');

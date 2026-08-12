@@ -39,7 +39,6 @@ class Shift extends Model
             'business_date' => DateOnly::class,
             'start_at' => 'datetime',
             'end_at' => 'datetime',
-            'unpaid_break_minutes' => 'integer',
             'repeat_until' => DateOnly::class,
             'split_part' => 'integer',
             'publish_state' => PublishState::class,
@@ -131,7 +130,9 @@ class Shift extends Model
             return 0.0;
         }
 
-        $minutes = abs($this->start_at->diffInMinutes($this->end_at)) - (int) $this->unpaid_break_minutes;
+        // No break subtracted: a planned shift has none. Break time comes
+        // only from TCP, on work_segments.break_minutes.
+        $minutes = abs($this->start_at->diffInMinutes($this->end_at));
 
         return round(max($minutes, 0) / 60, 2);
     }

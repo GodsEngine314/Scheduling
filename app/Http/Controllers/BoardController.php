@@ -6,6 +6,7 @@ use App\Enums\PublishState;
 use App\Enums\RequestDecision;
 use App\Exceptions\SchedulingException;
 use App\Models\EmployeeRequest;
+use App\Models\ActivityLog;
 use App\Models\Position;
 use App\Models\Shift;
 use App\Models\Store;
@@ -16,10 +17,15 @@ use App\Services\Scheduling\BoardService;
 use App\Services\Scheduling\DayCloseService;
 use App\Services\Scheduling\EmployeeRequestService;
 use App\Services\Scheduling\LaborCostEstimator;
+use App\Services\Scheduling\SchedulePublisher;
 use App\Services\Scheduling\ShiftService;
 use App\Services\Scheduling\WorkSegmentService;
+use App\Support\ActingUser;
 use App\Support\BusinessDay;
 use Database\Seeders\DemoSeeder;
+use Carbon\CarbonImmutable;
+use Carbon\CarbonInterface;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Artisan;
@@ -44,7 +50,9 @@ class BoardController extends Controller
         private readonly EmployeeRequestService $requests,
         private readonly DayCloseService $dayClose,
         private readonly LaborCostEstimator $costs,
+        private readonly SchedulePublisher $publisher,
         private readonly BusinessDay $businessDay,
+        private readonly ActingUser $actingUser,
     ) {}
 
     public function index(Request $request): View
@@ -84,6 +92,9 @@ class BoardController extends Controller
             'conflicts' => $conflicts,
             'positions' => Position::query()->orderBy('id')->get(),
             'roster' => $this->roster($storeId, $date),
+            // What the publish button is about to send, so the count is on the
+            // button rather than a surprise after pressing it.
+            'publishable' => $this->publisher->pendingInRange($storeId, $date, $date)->count(),
             'requests' => EmployeeRequest::query()
                 ->with(['employee', 'decisions'])
                 ->where('store_id', $storeId)
@@ -91,6 +102,208 @@ class BoardController extends Controller
                 ->get(),
             'timezone' => $board['timezone'],
         ]);
+    }
+
+    /**
+     * Switch who the console is acting as.
+     *
+     * NOT a login. It writes one id to the session so changes can be
+     * attributed; it grants and denies nothing. See App\Support\ActingUser.
+     */
+    public function setActingUser(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'user_id' => ['nullable', 'integer', 'exists:users,id'],
+        ]);
+
+        $this->actingUser->set(($data['user_id'] ?? null) === null ? null : (int) $data['user_id']);
+
+        return back()->with('ok', $this->actingUser->id() === null
+            ? 'Acting as nobody. Changes will be recorded as unattributed.'
+            : 'Now acting as '.$this->actingUser->name().'.');
+    }
+
+    /**
+     * The week grid: seven days across, one row per employee.
+     *
+     * The day board is for the ACTUAL side — punches, approvals, the close,
+     * all of which are inherently about one date. This is for building the
+     * plan, which people do a week at a time and by dragging.
+     */
+    public function week(Request $request): View
+    {
+        $stores = Store::query()->orderBy('id')->get();
+        $storeId = (int) ($request->query('store') ?: $stores->first()?->id ?: DemoSeeder::STORE_ID);
+
+        $anchor = (string) ($request->query('week')
+            ?: $this->businessDay->toLocal($storeId, now())->toDateString());
+
+        // Monday-first. startOfWeek() honours the app locale, which is not a
+        // decision this screen should inherit silently.
+        $start = CarbonImmutable::parse($anchor)->startOfWeek(CarbonInterface::MONDAY);
+        $days = collect(range(0, 6))->map(fn (int $i): string => $start->addDays($i)->toDateString());
+
+        $shifts = Shift::query()
+            ->with(['employee', 'position'])
+            // The chip shows whether a shift can be dragged, which depends on
+            // whether punches are reconciled against it. Counted here so a
+            // seven-day grid is one query, not one per chip.
+            ->withCount('workSegments')
+            ->forStoreBetween($storeId, $days->first(), $days->last())
+            ->get();
+
+        return view('board.week', [
+            'stores' => $stores,
+            'storeId' => $storeId,
+            'weekStart' => $start->toDateString(),
+            'days' => $days->all(),
+            'shifts' => $shifts,
+            'byCell' => $shifts->groupBy([
+                fn (Shift $s): string => (string) ($s->employee_id ?? 'open'),
+                fn (Shift $s): string => $this->dateOf($s->business_date),
+            ]),
+            'roster' => $this->roster($storeId, $days->first()),
+            'positions' => Position::query()->orderBy('id')->get(),
+            'costs' => $this->costs->estimateFor($shifts, $storeId, null),
+            'publishable' => $this->publisher->pendingInRange($storeId, $days->first(), $days->last())->count(),
+            'activity' => ActivityLog::query()
+                ->forStore($storeId)
+                ->coveringDates($days->first(), $days->last())
+                ->limit(40)
+                ->get(),
+            'timezone' => $this->businessDay->timezoneFor($storeId),
+        ]);
+    }
+
+    /** The full history, newest first. */
+    public function activity(Request $request): View
+    {
+        $stores = Store::query()->orderBy('id')->get();
+        $storeId = (int) ($request->query('store') ?: $stores->first()?->id ?: DemoSeeder::STORE_ID);
+
+        return view('board.activity', [
+            'stores' => $stores,
+            'storeId' => $storeId,
+            'entries' => ActivityLog::query()->forStore($storeId)->limit(300)->get(),
+        ]);
+    }
+
+    /**
+     * Drag a shift to another day or person.
+     *
+     * JSON in, JSON out: the grid posts and reloads rather than trying to keep
+     * a client-side model in step with the server. There is no second source
+     * of truth to drift.
+     */
+    public function moveShift(Request $request, Shift $shift): JsonResponse
+    {
+        return $this->drag($request, fn (?string $date, mixed $employeeId): Shift => $this->shifts->move($shift, $date, $employeeId));
+    }
+
+    /** The same drop, holding Ctrl or Alt: the original stays put. */
+    public function copyShift(Request $request, Shift $shift): JsonResponse
+    {
+        return $this->drag($request, fn (?string $date, mixed $employeeId): Shift => $this->shifts->copy($shift, $date, $employeeId));
+    }
+
+    /**
+     * @param  \Closure(?string, mixed): Shift  $action
+     */
+    private function drag(Request $request, \Closure $action): JsonResponse
+    {
+        $data = $request->validate([
+            'business_date' => ['nullable', 'date_format:Y-m-d'],
+            'employee_id' => ['nullable', 'integer', 'exists:employees,id'],
+            // Distinguishes "drop on the open-shifts row" from "leave the
+            // employee alone". Without it, a null employee_id is ambiguous.
+            'unassign' => ['nullable', 'boolean'],
+        ]);
+
+        $employeeId = match (true) {
+            (bool) ($data['unassign'] ?? false) => null,
+            ($data['employee_id'] ?? null) !== null => (int) $data['employee_id'],
+            default => false,
+        };
+
+        try {
+            $shift = $action($data['business_date'] ?? null, $employeeId);
+
+            return response()->json([
+                'ok' => true,
+                'shift_id' => (int) $shift->id,
+                'business_date' => $this->dateOf($shift->business_date),
+            ]);
+        } catch (SchedulingException $e) {
+            // 422, not 500: a refused drop is an answer, not a fault.
+            return response()->json(['ok' => false, 'message' => $e->getMessage()], 422);
+        } catch (Throwable $e) {
+            return response()->json([
+                'ok' => false,
+                'message' => class_basename($e).': '.$e->getMessage(),
+            ], 500);
+        }
+    }
+
+    private function dateOf(mixed $date): string
+    {
+        return $date instanceof \Carbon\CarbonInterface ? $date->toDateString() : (string) $date;
+    }
+
+    /**
+     * Send the visible range to Humanity. The only button on this console that
+     * talks to Humanity at all.
+     *
+     * Everything up to here is local, because a POST to Humanity is live the
+     * instant it lands. Safe to press twice: a shift whose fingerprint still
+     * matches is reported unchanged and costs no request.
+     */
+    public function publish(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'store_id' => ['required', 'integer', 'exists:stores,id'],
+            'from' => ['required', 'date_format:Y-m-d'],
+            'to' => ['required', 'date_format:Y-m-d', 'after_or_equal:from'],
+        ]);
+
+        try {
+            $result = $this->publisher->publishRange((int) $data['store_id'], $data['from'], $data['to']);
+        } catch (Throwable $e) {
+            return back()->with('err', class_basename($e).': '.$e->getMessage());
+        }
+
+        if ($result['total'] === 0) {
+            return back()->with('ok', 'Nothing to publish — every shift in view is already live and unchanged.');
+        }
+
+        $parts = [];
+        foreach (['created' => 'created', 'updated' => 'updated', 'unchanged' => 'unchanged', 'failed' => 'failed'] as $key => $word) {
+            if (($result[$key] ?? 0) > 0) {
+                $parts[] = $result[$key].' '.$word;
+            }
+        }
+
+        $message = 'Published '.$data['from'].' to '.$data['to'].': '.implode(', ', $parts).'.';
+
+        // A partial failure is still a failure worth surfacing loudly — some of
+        // the store's week is live and some is not.
+        return back()->with(($result['failed'] ?? 0) > 0 ? 'err' : 'ok', $message);
+    }
+
+    /**
+     * Unlock one published shift so it can be edited.
+     *
+     * Humanity keeps the shift and we keep its id, so the next publish sends a
+     * PUT rather than creating a duplicate. Employees see the last published
+     * version until then.
+     */
+    public function unpublishShift(Request $request, Shift $shift): RedirectResponse
+    {
+        return $this->attempt(
+            $request,
+            fn () => $this->publisher->unpublish($shift),
+            "Shift #{$shift->id} unpublished and editable. It is still live in Humanity — "
+                .'re-publish to send the change as a PUT.',
+        );
     }
 
     public function storeShift(Request $request): RedirectResponse
@@ -102,7 +315,6 @@ class BoardController extends Controller
             'position_id' => ['nullable', 'integer', 'exists:positions,id'],
             'start' => ['required', 'date_format:H:i'],
             'end' => ['required', 'date_format:H:i'],
-            'unpaid_break_minutes' => ['nullable', 'integer', 'min:0', 'max:240'],
             'notes' => ['nullable', 'string', 'max:500'],
         ]);
 
@@ -118,9 +330,8 @@ class BoardController extends Controller
             'position_id' => $data['position_id'] ?? null,
             'start_at_local' => "{$data['date']} {$data['start']}:00",
             'end_at_local' => "{$endDate} {$data['end']}:00",
-            'unpaid_break_minutes' => (int) ($data['unpaid_break_minutes'] ?? 0),
             'notes' => $data['notes'] ?? null,
-            'created_by_user_id' => User::query()->value('id'),
+            'created_by_user_id' => $this->actingUser->id(),
         ]), 'Shift added.');
     }
 
@@ -141,7 +352,6 @@ class BoardController extends Controller
             'position_id' => ['nullable', 'integer', 'exists:positions,id'],
             'start' => ['required', 'date_format:H:i'],
             'end' => ['required', 'date_format:H:i'],
-            'unpaid_break_minutes' => ['nullable', 'integer', 'min:0', 'max:240'],
             'notes' => ['nullable', 'string', 'max:500'],
         ]);
 
@@ -158,7 +368,6 @@ class BoardController extends Controller
                 'position_id' => $data['position_id'] ?? null,
                 'start_at_local' => "{$data['date']} {$data['start']}:00",
                 'end_at_local' => "{$endDate} {$data['end']}:00",
-                'unpaid_break_minutes' => (int) ($data['unpaid_break_minutes'] ?? 0),
                 'notes' => $data['notes'] ?? null,
             ]);
         }, "Shift #{$shift->id} updated locally."
@@ -204,7 +413,7 @@ class BoardController extends Controller
             $timeIn,
             $timeOut,
             $reapprove,
-            User::query()->value('id'),
+            $this->actingUser->id(),
         ), "Segment #{$segment->id} corrected and queued for TCP."
             .($reapprove ? ' Re-approved as instructed.' : ' Approval cleared — it needs reviewing again.'));
     }
@@ -334,7 +543,7 @@ class BoardController extends Controller
     {
         return $this->attempt(
             $request,
-            fn () => $this->segments->approve($segment, User::query()->value('id')),
+            fn () => $this->segments->approve($segment, $this->actingUser->id()),
             "Segment #{$segment->id} approved.",
         );
     }
@@ -344,32 +553,13 @@ class BoardController extends Controller
         return $this->attempt($request, fn () => $this->segments->delete($segment), 'Punch deleted.');
     }
 
-    public function approveAll(Request $request): RedirectResponse
-    {
-        $ids = WorkSegment::query()
-            ->forBoard((int) $request->input('store_id'), (string) $request->input('date'))
-            ->unapproved()
-            ->pluck('id')
-            ->all();
-
-        if ($ids === []) {
-            return back()->with('err', 'Nothing to approve. Open punches cannot be approved — they have no hours yet.');
-        }
-
-        return $this->attempt(
-            $request,
-            fn () => $this->segments->approveMany($ids, User::query()->value('id')),
-            count($ids).' segment(s) approved.',
-        );
-    }
-
     public function closeDay(Request $request): RedirectResponse
     {
         try {
             $result = $this->dayClose->close(
                 (int) $request->input('store_id'),
                 (string) $request->input('date'),
-                User::query()->value('id'),
+                $this->actingUser->id(),
             );
 
             return back()->with('ok', 'Day closed at '.$result['closed_at'].'.');
@@ -388,10 +578,19 @@ class BoardController extends Controller
             return back()->with('err', 'Unknown decision.');
         }
 
+        $notes = $request->filled('notes') ? (string) $request->input('notes') : null;
+
+        // Whether this is the first ruling or a reversal, so the flash can say
+        // which. Read before the write.
+        $revision = $employeeRequest->decisions()->count() + 1;
+
         return $this->attempt(
             $request,
-            fn () => $this->requests->decide($employeeRequest, $decision, User::query()->value('id')),
-            "Request #{$employeeRequest->id} {$decision->value}. The previous decision is kept in the trail.",
+            fn () => $this->requests->decide($employeeRequest, $decision, $this->actingUser->id(), $notes),
+            $revision === 1
+                ? "Request #{$employeeRequest->id} {$decision->value}."
+                : "Request #{$employeeRequest->id} changed to {$decision->value}. "
+                    .'The previous decision is kept in the trail.',
         );
     }
 

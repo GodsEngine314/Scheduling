@@ -83,7 +83,6 @@ class BoardService
             'end_at' => $shift->end_at?->toIso8601String(),
             'local_start' => $this->localClock($storeId, $shift->start_at),
             'local_end' => $this->localClock($storeId, $shift->end_at),
-            'unpaid_break_minutes' => (int) $shift->unpaid_break_minutes,
             'paid_hours' => $shift->paidHours(),
             'publish_state' => $shift->publish_state?->value,
             'availability_check' => $shift->availability_check?->value,

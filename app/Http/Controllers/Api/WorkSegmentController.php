@@ -2,7 +2,6 @@
 
 namespace App\Http\Controllers\Api;
 
-use App\Http\Requests\Api\WorkSegmentApproveRequest;
 use App\Http\Requests\Api\WorkSegmentIndexRequest;
 use App\Http\Requests\Api\WorkSegmentStoreRequest;
 use App\Http\Requests\Api\WorkSegmentUpdateRequest;
@@ -12,6 +11,7 @@ use App\Services\Scheduling\WorkSegmentService;
 use App\Support\BusinessDay;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 
 /**
  * Actual worked hours: what the day close signs off.
@@ -77,6 +77,22 @@ class WorkSegmentController extends ApiController
      * sent — a segment must not stay signed off for hours nobody has since
      * looked at.
      */
+    /**
+     * Approve one segment's hours.
+     *
+     * Per segment, never in bulk: each employee's hours are signed off
+     * individually so nobody clears a day's list without looking at it. An open
+     * punch is refused by the service — there are no hours to approve yet.
+     */
+    public function approve(Request $request, WorkSegment $workSegment): JsonResponse
+    {
+        return $this->attempt(function () use ($request, $workSegment): JsonResponse {
+            $approved = $this->segments->approve($workSegment, $this->actingUserId($request));
+
+            return WorkSegmentResource::make($approved->load(['employee', 'position']))->response();
+        });
+    }
+
     public function update(WorkSegmentUpdateRequest $request, WorkSegment $workSegment): JsonResponse
     {
         return $this->attempt(function () use ($request, $workSegment): JsonResponse {
@@ -104,27 +120,4 @@ class WorkSegmentController extends ApiController
         });
     }
 
-    /**
-     * Bulk approval — a manager signing off a screen of hours before closing
-     * the day.
-     *
-     * 200, not 207. The service reports per-id outcomes rather than throwing,
-     * so one stale id in a batch of forty is one skipped row and thirty-nine
-     * approvals; the response says which, and the request itself succeeded.
-     */
-    public function approve(WorkSegmentApproveRequest $request): JsonResponse
-    {
-        return $this->attempt(function () use ($request): JsonResponse {
-            $result = $this->segments->approveMany($request->ids(), $this->actingUserId($request));
-
-            return response()->json([
-                'data' => $result,
-                'meta' => [
-                    'requested' => count($request->ids()),
-                    'approved' => count($result['approved']),
-                    'skipped' => count($result['skipped']),
-                ],
-            ]);
-        });
-    }
 }
