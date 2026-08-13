@@ -30,13 +30,16 @@
 {{-- ── header ───────────────────────────────────────────────────────── --}}
 <div class="row-flex">
   <div class="card pad grow">
-    <h1>Store #{{ $storeId }} · {{ \Carbon\Carbon::parse($date)->format('l j M Y') }}</h1>
+    <h1>Store {{ $stores->firstWhere('id', $storeId)?->store_number ?? $storeId }} · {{ \Carbon\Carbon::parse($date)->format('l j M Y') }}</h1>
     <div class="lbl" style="margin-top:4px">{{ $timezone }} · business_date {{ $date }}</div>
     <form method="GET" action="{{ route('board') }}" class="ctl" style="margin-top:10px">
       <label class="f"><span class="lbl">Store</span>
+        {{-- Labelled by store_number, not id. The id is assigned by auth and
+             means nothing to anyone picking a store off this list; the number
+             is what is on the building and on every TCP record. --}}
         <select name="store">
           @foreach ($stores as $s)
-            <option value="{{ $s->id }}" @selected($s->id === $storeId)>#{{ $s->id }} — {{ $s->store_number }}</option>
+            <option value="{{ $s->id }}" @selected($s->id === $storeId)>{{ $s->store_number }}</option>
           @endforeach
         </select>
       </label>

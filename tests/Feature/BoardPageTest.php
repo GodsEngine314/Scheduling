@@ -1,6 +1,9 @@
 <?php
 
+use App\Models\Employee;
+use App\Models\EmployeeRequest;
 use App\Models\Shift;
+use App\Models\Store;
 use App\Models\WorkSegment;
 use App\Support\BusinessDay;
 use Database\Seeders\DemoSeeder;
@@ -33,9 +36,14 @@ it('redirects the root to the board', function () {
 });
 
 it('renders the board with the seeded day', function () {
+    // Headed and listed by store_number, never by the id. The id is assigned by
+    // auth, means nothing to anyone reading the board, and is not what appears
+    // on the building or on a TCP record.
+    $storeNumber = Store::findOrFail(DemoSeeder::STORE_ID)->store_number;
+
     $this->get('/board')
         ->assertOk()
-        ->assertSee('Store #'.DemoSeeder::STORE_ID)
+        ->assertSee('Store '.$storeNumber)
         ->assertSee('Ada Okafor')
         ->assertSee('Ben Ortiz');
 });
@@ -81,7 +89,7 @@ it('closes the day once every punch is out and approved', function () {
 
 it('adds a shift and flags it when it falls outside availability', function () {
     // Ben's window closes at 21:00; 08:00-10:00 is nowhere near it.
-    $ben = \App\Models\Employee::where('first_name', 'Ben')->firstOrFail();
+    $ben = Employee::where('first_name', 'Ben')->firstOrFail();
 
     $this->post('/board/shifts', [
         'store_id' => DemoSeeder::STORE_ID,
@@ -99,7 +107,7 @@ it('adds a shift and flags it when it falls outside availability', function () {
 });
 
 it('accepts an end before a start as an overnight shift', function () {
-    $cleo = \App\Models\Employee::where('first_name', 'Cleo')->firstOrFail();
+    $cleo = Employee::where('first_name', 'Cleo')->firstOrFail();
 
     $this->post('/board/shifts', [
         'store_id' => DemoSeeder::STORE_ID,
@@ -208,7 +216,7 @@ it('edits a planned shift in store-local time', function () {
 });
 
 it('records a reversal in the decision trail rather than overwriting it', function () {
-    $request = \App\Models\EmployeeRequest::where('status', 'approved')->firstOrFail();
+    $request = EmployeeRequest::where('status', 'approved')->firstOrFail();
 
     $this->post("/board/requests/{$request->id}/decide", ['decision' => 'cancelled'])
         ->assertRedirect();

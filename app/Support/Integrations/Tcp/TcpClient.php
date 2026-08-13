@@ -2,6 +2,7 @@
 
 namespace App\Support\Integrations\Tcp;
 
+use App\DataTransferObjects\EmployeeFilter;
 use App\DataTransferObjects\WorkSegmentFilter;
 use App\Exceptions\IntegrationException;
 use App\Support\Integrations\AbstractApiClient;
@@ -127,7 +128,28 @@ class TcpClient extends AbstractApiClient
         $records = [];
 
         foreach ($filter->chunked() as $chunk) {
-            $records = array_merge($records, $this->paginate($chunk->withPerPage($perPage)));
+            $records = array_merge($records, $this->paginate(self::WORK_SEGMENTS_PATH, $chunk->withPerPage($perPage)));
+        }
+
+        return $records;
+    }
+
+    /**
+     * Every employee the filter matches — all chunks, all pages.
+     *
+     * READ-ONLY, and the mirror image of createEmployee/updateEmployee: this
+     * asks TCP who it thinks works somewhere, it does not tell it. Used to
+     * reconcile a store's roster, which is why it is scoped by location.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    public function employees(EmployeeFilter $filter): array
+    {
+        $perPage = $this->pageSize();
+        $records = [];
+
+        foreach ($filter->chunked() as $chunk) {
+            $records = array_merge($records, $this->paginate(self::EMPLOYEES_PATH, $chunk->withPerPage($perPage)));
         }
 
         return $records;
@@ -200,7 +222,7 @@ class TcpClient extends AbstractApiClient
      *
      * @return array<int,array<string,mixed>>
      */
-    private function paginate(WorkSegmentFilter $filter): array
+    private function paginate(string $path, WorkSegmentFilter|EmployeeFilter $filter): array
     {
         $perPage = $filter->perPage ?? $this->pageSize();
         $records = [];
@@ -210,12 +232,12 @@ class TcpClient extends AbstractApiClient
             if ($page > self::MAX_PAGES) {
                 throw IntegrationException::guard(
                     'tcp',
-                    $this->endpoint(self::WORK_SEGMENTS_PATH),
-                    'Work segment pagination passed '.self::MAX_PAGES.' pages; the page parameter is being ignored.',
+                    $this->endpoint($path),
+                    'Pagination on '.$path.' passed '.self::MAX_PAGES.' pages; the page parameter is being ignored.',
                 );
             }
 
-            $batch = $this->records($this->get(self::WORK_SEGMENTS_PATH, $filter->withPage($page)->toQuery()));
+            $batch = $this->records($this->get($path, $filter->withPage($page)->toQuery()));
 
             if ($batch === []) {
                 break;

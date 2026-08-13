@@ -15,6 +15,21 @@
 return [
     'base_uri' => env('HUMANITY_BASE_URI', 'https://www.humanity.com/api/v2'),
 
+    /**
+     * 'oauth'  — exchange username/password for a short-lived token.
+     * 'static' — a long-lived token pasted into the env, no token call.
+     *
+     * The same two modes TCP has, and the same trade-off: static is the fast
+     * way to get a real request working, but it opts OUT of the 401 refresh in
+     * AbstractApiClient, which only fires for 'oauth'. An expired static token
+     * therefore fails every call until somebody edits the env, where an oauth
+     * one repairs itself once and carries on.
+     */
+    'auth_mode' => env('HUMANITY_AUTH_MODE', 'oauth'),
+
+    // Used only when auth_mode is 'static'.
+    'static_token' => env('HUMANITY_STATIC_TOKEN'),
+
     'oauth' => [
         'token_path' => env('HUMANITY_TOKEN_PATH', '/oauth2/token'),
         'grant_type' => 'password',

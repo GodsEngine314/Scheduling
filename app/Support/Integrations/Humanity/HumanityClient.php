@@ -36,8 +36,16 @@ class HumanityClient extends AbstractApiClient
 
     protected function authDescriptor(): array
     {
+        $mode = (string) config('humanity.auth_mode', 'oauth');
         $transport = (string) config('humanity.auth_transport', '_token');
         $param = (string) config('humanity.token_query_param', '_token');
+
+        if (! in_array($mode, ['oauth', 'static'], true)) {
+            throw IntegrationException::configuration(
+                'humanity',
+                "Unknown humanity.auth_mode '{$mode}'; expected 'oauth' or 'static'.",
+            );
+        }
 
         if (! in_array($transport, ['_token', 'bearer'], true)) {
             throw IntegrationException::configuration(
@@ -46,15 +54,30 @@ class HumanityClient extends AbstractApiClient
             );
         }
 
+        $staticToken = trim((string) (config('humanity.static_token') ?? ''));
+
+        // Refused rather than sent empty. An Authorization header reading
+        // "Bearer " is a 401 from the vendor that looks like a bad credential
+        // instead of what it is — a missing line in the env.
+        if ($mode === 'static' && $staticToken === '') {
+            throw IntegrationException::configuration(
+                'humanity',
+                "humanity.auth_mode is 'static' but humanity.static_token is empty.",
+            );
+        }
+
         return [
-            // Humanity has no static-token mode: the config only describes an
-            // oauth password grant, so the 401-refresh path always applies.
-            'mode' => 'oauth',
+            // MODE AND TRANSPORT ARE INDEPENDENT. mode says where the token
+            // comes from — a token call, or the env. transport says how it
+            // rides on the request — a query parameter, or a header. Humanity's
+            // own examples use ?_token=, so that stays the default whichever
+            // mode is in play.
+            'mode' => $mode,
             'transport' => $transport === 'bearer' ? 'header' : 'query',
             'header' => 'Authorization',
             'prefix' => 'Bearer',
             'param' => $param,
-            'token' => null,
+            'token' => $mode === 'static' ? $staticToken : null,
         ];
     }
 

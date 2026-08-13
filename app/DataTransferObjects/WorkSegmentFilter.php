@@ -7,7 +7,7 @@ namespace App\DataTransferObjects;
  *
  * Two things here are not cosmetic:
  *
- * THE CAP. Each of the four list filters accepts at most 20 values. A longer
+ * THE CAP. Each of the five list filters accepts at most 20 values. A longer
  * list is not an error at the vendor — it is worse than an error, because the
  * extra values are dropped and the response looks perfectly normal. Forty-five
  * employee ids would come back as the punches of the first twenty and nobody
@@ -27,6 +27,7 @@ namespace App\DataTransferObjects;
 final readonly class WorkSegmentFilter
 {
     /**
+     * @param  array<int,int|string>  $locationIds  TCP location ids, NOT our store ids
      * @param  array<int,int|string>  $employeeIds
      * @param  array<int,int|string>  $jobCodeIds
      * @param  array<int,string>  $costCodeNames
@@ -37,6 +38,7 @@ final readonly class WorkSegmentFilter
      * @param  string|null  $updatedOnTo  ISO-8601
      */
     public function __construct(
+        public array $locationIds = [],
         public array $employeeIds = [],
         public array $jobCodeIds = [],
         public array $costCodeNames = [],
@@ -47,8 +49,7 @@ final readonly class WorkSegmentFilter
         public ?string $updatedOnTo = null,
         public ?int $page = null,
         public ?int $perPage = null,
-    ) {
-    }
+    ) {}
 
     public function withPage(int $page): self
     {
@@ -70,16 +71,19 @@ final readonly class WorkSegmentFilter
     {
         $cap = max(1, (int) config('tcp.filter_value_cap', 20));
 
-        foreach ($this->chunkValues($this->employeeIds, $cap) as $employeeIds) {
-            foreach ($this->chunkValues($this->jobCodeIds, $cap) as $jobCodeIds) {
-                foreach ($this->chunkValues($this->costCodeNames, $cap) as $costCodeNames) {
-                    foreach ($this->chunkValues($this->laborCodes, $cap) as $laborCodes) {
-                        yield $this->with([
-                            'employeeIds' => $employeeIds,
-                            'jobCodeIds' => $jobCodeIds,
-                            'costCodeNames' => $costCodeNames,
-                            'laborCodes' => $laborCodes,
-                        ]);
+        foreach ($this->chunkValues($this->locationIds, $cap) as $locationIds) {
+            foreach ($this->chunkValues($this->employeeIds, $cap) as $employeeIds) {
+                foreach ($this->chunkValues($this->jobCodeIds, $cap) as $jobCodeIds) {
+                    foreach ($this->chunkValues($this->costCodeNames, $cap) as $costCodeNames) {
+                        foreach ($this->chunkValues($this->laborCodes, $cap) as $laborCodes) {
+                            yield $this->with([
+                                'locationIds' => $locationIds,
+                                'employeeIds' => $employeeIds,
+                                'jobCodeIds' => $jobCodeIds,
+                                'costCodeNames' => $costCodeNames,
+                                'laborCodes' => $laborCodes,
+                            ]);
+                        }
                     }
                 }
             }
@@ -94,6 +98,10 @@ final readonly class WorkSegmentFilter
     public function toQuery(): array
     {
         $parameters = [
+            // GUESS, like every other name here: TCP's location records call
+            // the field `id` and the job codes call it `locationName`, so the
+            // plural query parameter is inferred from the employeeIds pattern.
+            'locationIds' => $this->locationIds,
             'employeeIds' => $this->employeeIds,
             'jobCodeIds' => $this->jobCodeIds,
             'costCodeNames' => $this->costCodeNames,
@@ -156,6 +164,7 @@ final readonly class WorkSegmentFilter
     private function with(array $overrides): self
     {
         return new self(
+            $overrides['locationIds'] ?? $this->locationIds,
             $overrides['employeeIds'] ?? $this->employeeIds,
             $overrides['jobCodeIds'] ?? $this->jobCodeIds,
             $overrides['costCodeNames'] ?? $this->costCodeNames,

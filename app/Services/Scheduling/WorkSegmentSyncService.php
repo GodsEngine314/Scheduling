@@ -56,14 +56,44 @@ class WorkSegmentSyncService
      */
     public function syncDate(string $date, ?int $storeId = null): array
     {
-        $employeeIds = $storeId === null ? [] : $this->tcpEmployeeIdsForStore($storeId);
+        if ($storeId === null) {
+            return $this->sync(
+                new WorkSegmentFilter(startDate: $date, endDate: $date),
+                null,
+            );
+        }
 
-        if ($storeId !== null && $employeeIds === []) {
+        // The store's own TCP location id asks the question directly, and it is
+        // a strictly better question than the employee list below ever was.
+        // "The people we think work here" misses somebody covering from another
+        // store and wrongly pulls in one of ours covering elsewhere; a location
+        // filter is about where the punch happened, which is what a store-day
+        // board is actually asking. It also sidesteps the 20-value cap, since
+        // one store is one value.
+        $locationId = $this->tcpLocationIdForStore($storeId);
+
+        if ($locationId !== null) {
+            return $this->sync(
+                new WorkSegmentFilter(
+                    locationIds: [$locationId],
+                    startDate: $date,
+                    endDate: $date,
+                ),
+                $storeId,
+            );
+        }
+
+        // No mapping for this store yet. Fall back to the employee list rather
+        // than dropping the filter: an unmapped store is a missing
+        // integration_identities row, not permission to pull the whole estate.
+        $employeeIds = $this->tcpEmployeeIdsForStore($storeId);
+
+        if ($employeeIds === []) {
             // An empty employeeIds list is "no filter on employees", not "no
             // employees" — sending it would quietly widen a one-store sync into
             // every store's punches for the day.
             return $this->report(0, 0, 0, 0, 0, [[
-                'reason' => 'store_has_no_tcp_employees',
+                'reason' => 'store_has_no_tcp_location_or_employees',
                 'store_id' => $storeId,
             ]]);
         }
@@ -517,13 +547,34 @@ class WorkSegmentSyncService
     }
 
     /**
+     * This store's TCP location id, or null when nobody has mapped it.
+     *
+     * SCHEDULING-OWNED, and read from integration_identities rather than any
+     * column on the stores projection: a replay rebuilds stores from auth's
+     * events, which carry no TCP id, so a projected copy would vanish and every
+     * subsequent sync would silently fall back to the employee list.
+     *
+     * Not memoised — one call per sync run.
+     */
+    private function tcpLocationIdForStore(int $storeId): ?string
+    {
+        $external = IntegrationIdentity::query()
+            ->forEntity(IntegrationEntityType::Store, $storeId, IntegrationSystem::Tcp)
+            ->value('external_id');
+
+        return $this->string($external);
+    }
+
+    /**
      * The TCP ids of everyone who works at this store: primary store plus any
      * explicit assignment, because a person can be scheduled somewhere that is
      * not their primary store.
      *
-     * GET /worksegments has no store filter, so scoping a date sync to one
-     * store means naming its people — which is precisely the list that passes
-     * the vendor's 20-value cap and needs chunking.
+     * THE FALLBACK, not the main path. syncDate() prefers the store's TCP
+     * location id and only names people when that mapping is missing, because
+     * this list answers a subtly different question — who we think works here,
+     * rather than where the punch happened — and it is precisely the list that
+     * passes the vendor's 20-value cap and needs chunking.
      *
      * @return array<int, string>
      */

@@ -28,9 +28,11 @@ uses(RefreshDatabase::class);
 */
 
 beforeEach(function () {
-    // Humanity is OAuth only — it has no static-token mode the way TCP does —
-    // so the credentials have to be present or the client dies fetching a token
-    // before it ever reaches /shifts.
+    // These tests exercise the OAuth path deliberately, which is the default
+    // mode and the one with the 401-refresh behaviour. The credentials have to
+    // be present or the client dies fetching a token before it ever reaches
+    // /shifts. (A static token is the other option — see humanity.auth_mode —
+    // but it would skip the token call these tests assert on.)
     config()->set('humanity.oauth.client_id', 'cid');
     config()->set('humanity.oauth.client_secret', 'secret');
     config()->set('humanity.oauth.username', 'user');

@@ -18,6 +18,7 @@ use App\Services\Scheduling\EmployeeRequestService;
 use App\Services\Scheduling\LaborCostEstimator;
 use App\Services\Scheduling\SchedulePublisher;
 use App\Services\Scheduling\ShiftService;
+use App\Services\Scheduling\TcpEmployeeReader;
 use App\Services\Scheduling\WorkSegmentService;
 use App\Services\Scheduling\WorkSegmentSyncService;
 use App\Support\ActingUser;
@@ -43,6 +44,9 @@ use Throwable;
  */
 class BoardController extends Controller
 {
+    /** The store the roster was last read from TCP for. See pullEmployeesOnStoreChange(). */
+    private const EMPLOYEE_PULL_KEY = 'tcp_employee_pull_store';
+
     public function __construct(
         private readonly BoardService $board,
         private readonly ShiftService $shifts,
@@ -52,6 +56,7 @@ class BoardController extends Controller
         private readonly LaborCostEstimator $costs,
         private readonly SchedulePublisher $publisher,
         private readonly WorkSegmentSyncService $segmentSync,
+        private readonly TcpEmployeeReader $tcpEmployees,
         private readonly BusinessDay $businessDay,
         private readonly ActingUser $actingUser,
     ) {}
@@ -60,6 +65,8 @@ class BoardController extends Controller
     {
         $stores = Store::query()->orderBy('id')->get();
         $storeId = (int) ($request->query('store') ?: $stores->first()?->id ?: DemoSeeder::STORE_ID);
+
+        $this->pullEmployeesOnStoreChange($request, $storeId);
 
         $date = (string) ($request->query('date')
             ?: $this->businessDay->toLocal($storeId, now())->toDateString());
@@ -103,6 +110,97 @@ class BoardController extends Controller
                 ->get(),
             'timezone' => $board['timezone'],
         ]);
+    }
+
+    /**
+     * Ask TCP for this store's roster the first time the board lands on it.
+     *
+     * ON CHANGE, NOT ON RENDER. The board re-renders on every date step and
+     * after every POST-then-redirect, and a vendor round trip on each of those
+     * would put TCP's latency in front of the main screen and burn the retry
+     * budget on a client whose timeout is 30 seconds. The last store pulled is
+     * kept in the session, so switching stores costs one call and paging
+     * through a fortnight costs none.
+     *
+     * NOTHING HERE CAN BREAK THE BOARD. The pull is a convenience; the schedule
+     * is not. Any failure degrades to a message and the page renders exactly as
+     * it would have — which is why the whole thing is wrapped, rather than
+     * trusting the client to only ever throw IntegrationException.
+     *
+     * It only ever writes integration_identities. See TcpEmployeeReader: an
+     * employee TCP knows about and we do not is reported, never created, because
+     * `employees` is a projection and an invented row there is erased by the
+     * next replay.
+     */
+    private function pullEmployeesOnStoreChange(Request $request, int $storeId): void
+    {
+        if (! $request->hasSession() || (int) $request->session()->get(self::EMPLOYEE_PULL_KEY) === $storeId) {
+            return;
+        }
+
+        // Recorded BEFORE the call, not after: a store whose pull fails must not
+        // retry on every subsequent render of the same board.
+        $request->session()->put(self::EMPLOYEE_PULL_KEY, $storeId);
+
+        try {
+            $report = $this->tcpEmployees->forStore($storeId);
+        } catch (Throwable $e) {
+            $this->flashNow('err', 'Could not read the roster from TCP — '.class_basename($e).': '.$e->getMessage());
+
+            return;
+        }
+
+        // Not configured, or not mapped: both are ordinary states in a service
+        // that is still being wired up, and neither is worth shouting about on
+        // a screen somebody opened to look at a schedule.
+        $reasons = array_column($report['skipped'], 'reason');
+
+        if (in_array('tcp_not_configured', $reasons, true)) {
+            return;
+        }
+
+        if (in_array('store_has_no_tcp_location', $reasons, true)) {
+            $this->flashNow('err', 'This store has no TCP location id, so its roster could not be read.');
+
+            return;
+        }
+
+        $unmatched = $report['unmatched'];
+
+        $message = 'TCP roster: '.$report['fetched'].' at this location, '
+            .$report['mapped'].' newly linked, '.$report['already_mapped'].' already linked.';
+
+        if ($unmatched === []) {
+            $this->flashNow('ok', $message);
+
+            return;
+        }
+
+        // The interesting half. These people are on TCP's roster for this store
+        // and are in no hiring event we have seen, so they cannot be scheduled
+        // until hiring sends them — naming them is what makes that actionable.
+        $names = collect($unmatched)->take(5)->pluck('name')->join(', ');
+
+        $this->flashNow('err', $message.' '.count($unmatched).' not in our roster'
+            .' ('.$names.(count($unmatched) > 5 ? ', …' : '').')'
+            .' — they arrive from hiring, and are not created from TCP.');
+    }
+
+    /**
+     * Flash for THIS render, not the next one.
+     *
+     * index() is reached by a GET, so there is no redirect to carry an ordinary
+     * flash. now() also has to yield to anything a redirect already put there:
+     * the result of the action somebody just took matters more than a roster
+     * summary they did not ask for.
+     */
+    private function flashNow(string $key, string $message): void
+    {
+        if (session()->has('ok') || session()->has('err')) {
+            return;
+        }
+
+        session()->now($key, $message);
     }
 
     /**

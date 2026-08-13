@@ -12,7 +12,7 @@ class SyncWorkSegmentsCommand extends Command
 {
     protected $signature = 'scheduling:sync-segments
         {--date= : Sync one business date (YYYY-MM-DD)}
-        {--store= : With --date, limit the pull to the employees of one store}
+        {--store= : With --date, limit the pull to one store (by its TCP location id, falling back to its employees)}
         {--minutes= : Sync everything TCP changed in the last N minutes}';
 
     protected $description = 'Pull work segments from TCP into work_segments, by date or by TCP updatedOn window.';
