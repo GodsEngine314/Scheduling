@@ -1,9 +1,6 @@
 <?php
 
-use App\Enums\ActivityAction;
-use App\Enums\ActivitySubject;
 use App\Enums\RequestDecision;
-use App\Models\ActivityLog;
 use App\Models\Employee;
 use App\Models\EmployeeRequest;
 use App\Models\Shift;
@@ -11,7 +8,6 @@ use App\Models\User;
 use App\Models\WorkSegment;
 use App\Services\Scheduling\EmployeeRequestService;
 use App\Services\Scheduling\ShiftService;
-use App\Support\ActingUser;
 use App\Support\BusinessDay;
 use Database\Seeders\DemoSeeder;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -22,12 +18,17 @@ uses(RefreshDatabase::class);
 
 /*
 |--------------------------------------------------------------------------
-| The week grid, moving and copying, and the audit trail
+| The week grid, moving and copying
 |--------------------------------------------------------------------------
 |
-| Several managers share one schedule, so "the shift moved" is half an answer.
-| These pin the other half: who moved it, what it looked like before, and that
-| the record survives the actor being deleted.
+| Dragging is the primary way the plan gets built, so these pin what a drop
+| may and may not do: the clock times survive a move to another day, a copy
+| never joins the original's series, and a shift with punches against it
+| refuses to move at all.
+|
+| Attribution is only as good as the columns that carry it — there is no
+| activity log, so created_by_user_id and approved_by_user_id are the whole
+| record of who did something.
 |
 */
 
@@ -192,7 +193,9 @@ it('allows copying a shift that has punches, even though moving is refused', fun
 
 // ── the audit trail ─────────────────────────────────────────────────────
 
-it('records who created a shift, by name as well as id', function () {
+// ── acting as ───────────────────────────────────────────────────────────
+
+it('stamps a created shift with the acting user', function () {
     $manager = User::firstOrFail();
     $this->post('/acting-user', ['user_id' => $manager->id]);
 
@@ -204,102 +207,62 @@ it('records who created a shift, by name as well as id', function () {
         'end' => '12:00',
     ])->assertRedirect();
 
-    $entry = ActivityLog::query()->where('action', ActivityAction::Created)->latest('id')->firstOrFail();
-
-    expect((int) $entry->user_id)->toBe((int) $manager->id)
-        ->and($entry->actor_name)->toBe($manager->name)
-        ->and($entry->subject_type)->toBe(ActivitySubject::Shift);
+    expect((int) Shift::latest('id')->firstOrFail()->created_by_user_id)->toBe((int) $manager->id);
 });
 
-it('keeps the actor name after the auth user is deleted', function () {
-    $manager = User::firstOrFail();
-    $this->post('/acting-user', ['user_id' => $manager->id]);
+it('leaves the actor null when nobody is acting', function () {
+    $this->post('/board/shifts', [
+        'store_id' => DemoSeeder::STORE_ID,
+        'date' => $this->today,
+        'employee_id' => Employee::value('id'),
+        'start' => '09:00',
+        'end' => '12:00',
+    ])->assertRedirect();
 
-    $shift = draggableShift();
-    $this->postJson("/board/shifts/{$shift->id}/move", ['business_date' => $this->tomorrow])->assertOk();
-
-    $entry = ActivityLog::query()->where('action', ActivityAction::Moved)->latest('id')->firstOrFail();
-    $name = $entry->actor_name;
-
-    // users is a PROJECTION — auth can delete one at any time. nullOnDelete
-    // keeps the projection appliable; the snapshot keeps the row meaningful.
-    Shift::query()->update(['created_by_user_id' => null]);
-    WorkSegment::query()->update(['approved_by_user_id' => null, 'times_corrected_by_user_id' => null]);
-    User::whereKey($manager->id)->delete();
-
-    $entry->refresh();
-
-    expect($entry->user_id)->toBeNull()
-        ->and($entry->actor_name)->toBe($name);
+    expect(Shift::latest('id')->firstOrFail()->created_by_user_id)->toBeNull();
 });
-
-it('records a move with what changed, not just that something did', function () {
-    $shift = draggableShift();
-    $was = $shift->business_date->toDateString();
-
-    $this->postJson("/board/shifts/{$shift->id}/move", ['business_date' => $this->tomorrow])->assertOk();
-
-    $entry = ActivityLog::query()->where('action', ActivityAction::Moved)->latest('id')->firstOrFail();
-
-    expect($entry->changed_fields)->toHaveKey('business_date')
-        ->and($entry->changed_fields['business_date']['from'])->toBe($was)
-        ->and($entry->changed_fields['business_date']['to'])->toBe($this->tomorrow)
-        // Rendered, not just stored: the column cannot be called `changes`,
-        // which collides with Eloquent's own dirty-tracking property.
-        ->and($entry->summariseChanges())->toContain($was, $this->tomorrow);
-});
-
-it('separates a move from an ordinary edit in the log', function () {
-    $shift = draggableShift();
-
-    $this->postJson("/board/shifts/{$shift->id}/move", ['business_date' => $this->tomorrow])->assertOk();
-
-    // "Dana moved Ben's shift to Thursday" is the sentence a manager needs,
-    // and it cannot be recovered from a field diff after the fact.
-    expect(ActivityLog::where('action', ActivityAction::Moved)->count())->toBe(1)
-        ->and(ActivityLog::where('action', ActivityAction::Copied)->count())->toBe(0);
-});
-
-it('records an unattributed change when nobody is acting', function () {
-    $shift = draggableShift();
-
-    $this->postJson("/board/shifts/{$shift->id}/move", ['business_date' => $this->tomorrow])->assertOk();
-
-    $entry = ActivityLog::query()->where('action', ActivityAction::Moved)->latest('id')->firstOrFail();
-
-    // Says so plainly rather than leaving a blank that reads like a bug.
-    expect($entry->user_id)->toBeNull()
-        ->and($entry->actor_name)->toBe('Unattributed');
-});
-
-it('shows the activity on the week page', function () {
-    $shift = draggableShift();
-    $this->postJson("/board/shifts/{$shift->id}/move", ['business_date' => $this->tomorrow])->assertOk();
-
-    $this->get('/board/week')->assertOk()->assertSee('Activity this week');
-    $this->get('/board/activity')->assertOk()->assertSee('moved');
-});
-
-// ── acting as ───────────────────────────────────────────────────────────
 
 it('switches the acting user and stamps the next change with them', function () {
     $first = User::orderBy('id')->firstOrFail();
     $second = User::query()->where('id', '!=', $first->id)->first()
         ?? User::create(['name' => 'Second Manager', 'email' => 'second@example.test', 'password' => 'x']);
-    $users = collect([$first, $second]);
 
-    $this->post('/acting-user', ['user_id' => $users[0]->id])->assertRedirect();
-    $shift = draggableShift();
-    $this->postJson("/board/shifts/{$shift->id}/move", ['business_date' => $this->tomorrow])->assertOk();
+    $this->post('/acting-user', ['user_id' => $first->id])->assertRedirect();
+    $this->post('/board/shifts', [
+        'store_id' => DemoSeeder::STORE_ID,
+        'date' => $this->today,
+        'employee_id' => Employee::value('id'),
+        'start' => '09:00',
+        'end' => '12:00',
+    ])->assertRedirect();
+    $created = Shift::latest('id')->firstOrFail();
 
-    $this->post('/acting-user', ['user_id' => $users[1]->id])->assertRedirect();
+    $this->post('/acting-user', ['user_id' => $second->id])->assertRedirect();
     $segment = WorkSegment::whereNotNull('time_out')->where('manager_approval', false)->firstOrFail();
     $this->post("/board/segments/{$segment->id}/approve")->assertRedirect();
 
-    expect(ActivityLog::where('action', ActivityAction::Moved)->latest('id')->first()->actor_name)
-        ->toBe($users[0]->name)
-        ->and(ActivityLog::where('action', ActivityAction::Approved)->latest('id')->first()->actor_name)
-        ->toBe($users[1]->name);
+    expect((int) $created->created_by_user_id)->toBe((int) $first->id)
+        ->and((int) $segment->fresh()->approved_by_user_id)->toBe((int) $second->id);
+});
+
+it('blanks the actor rather than blocking when the auth user is deleted', function () {
+    $manager = User::firstOrFail();
+    $this->post('/acting-user', ['user_id' => $manager->id]);
+
+    $segment = WorkSegment::whereNotNull('time_out')->where('manager_approval', false)->firstOrFail();
+    $this->post("/board/segments/{$segment->id}/approve")->assertRedirect();
+
+    expect((int) $segment->fresh()->approved_by_user_id)->toBe((int) $manager->id);
+
+    // users is a PROJECTION — auth can delete one at any time, and every
+    // scheduling-owned reference to it is nullOnDelete so the delete event
+    // stays appliable rather than parking forever.
+    Shift::query()->update(['created_by_user_id' => null]);
+    WorkSegment::query()->update(['times_corrected_by_user_id' => null]);
+    User::whereKey($manager->id)->delete();
+
+    expect($segment->fresh()->approved_by_user_id)->toBeNull()
+        ->and((bool) $segment->fresh()->manager_approval)->toBeTrue();
 });
 
 // ── re-deciding a request ───────────────────────────────────────────────
@@ -318,7 +281,7 @@ it('appends a decision rather than overwriting, and re-caches the status', funct
     // anyone asks about afterwards.
     expect($trail)->toBe(['approved', 'cancelled'])
         ->and($request->fresh()->status->value)->toBe('cancelled')
-        ->and(ActivityLog::where('action', ActivityAction::Decided)->where('subject_id', $request->id)->count())->toBe(2);
+        ->and($request->decisions()->count())->toBe(2);
 });
 
 it('shows edit-decision on a settled request and the three buttons on a pending one', function () {

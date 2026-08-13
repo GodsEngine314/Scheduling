@@ -2,14 +2,12 @@
 
 namespace App\Services\Scheduling;
 
-use App\Enums\ActivityAction;
 use App\Enums\AvailabilityCheck;
 use App\Enums\PublishState;
 use App\Exceptions\SchedulingException;
 use App\Models\Employee;
 use App\Models\EmployeeRequest;
 use App\Models\Shift;
-use App\Services\ActivityLogger;
 use App\Support\BusinessDay;
 use Carbon\CarbonImmutable;
 use Carbon\CarbonInterface;
@@ -72,19 +70,10 @@ class ShiftService
     public function __construct(
         private readonly BusinessDay $businessDay,
         private readonly AvailabilityChecker $availability,
-        private readonly ActivityLogger $activity,
     ) {}
 
-    /**
-     * @param  ActivityAction  $as  what this creation IS — copy() passes Copied
-     *                              so one drag writes one line, not two
-     * @param  array<string, mixed>  $context  recorded alongside it
-     */
-    public function create(
-        array $attributes,
-        ActivityAction $as = ActivityAction::Created,
-        array $context = [],
-    ): Shift {
+    public function create(array $attributes): Shift
+    {
         $storeId = $this->requireStoreId($attributes['store_id'] ?? null);
         [$startUtc, $endUtc] = $this->resolveInstants($storeId, $attributes, null);
 
@@ -106,26 +95,17 @@ class ShiftService
             'availability_check' => $this->availabilityFor($employeeId, $storeId, $startUtc, $endUtc),
         ]);
 
-        $shift = DB::transaction(fn (): Shift => Shift::query()->create($payload));
-
-        $this->activity->shift($shift, $as, [], $context);
-
-        return $shift;
+        return DB::transaction(fn (): Shift => Shift::query()->create($payload));
     }
 
-    /**
-     * @param  ?ActivityAction  $as  null suppresses the log entirely, for
-     *                               callers like move() that record their own
-     *                               higher-level action instead
-     */
-    public function update(Shift $shift, array $attributes, ?ActivityAction $as = ActivityAction::Updated): Shift
+    public function update(Shift $shift, array $attributes): Shift
     {
         $this->refuseIfLocked($shift, 'edited');
 
         $storeId = $this->requireStoreId($attributes['store_id'] ?? $shift->store_id);
         [$startUtc, $endUtc] = $this->resolveInstants($storeId, $attributes, $shift);
 
-        return DB::transaction(function () use ($shift, $attributes, $storeId, $startUtc, $endUtc, $as): Shift {
+        return DB::transaction(function () use ($shift, $attributes, $storeId, $startUtc, $endUtc): Shift {
             $shift->fill(array_merge($this->payload($attributes, self::UPDATABLE), [
                 'store_id' => $storeId,
                 'start_at' => $startUtc,
@@ -145,18 +125,7 @@ class ShiftService
             $employeeId = $shift->employee_id === null ? null : (int) $shift->employee_id;
             $shift->availability_check = $this->availabilityFor($employeeId, $storeId, $startUtc, $endUtc);
 
-            // Captured BEFORE save(), while the dirty set still describes the
-            // edit. Afterwards everything is clean and the diff is empty.
-            $changes = $this->activity->diff($shift, [
-                'employee_id', 'position_id', 'business_date',
-                'start_at', 'end_at', 'notes',
-            ]);
-
             $shift->save();
-
-            if ($changes !== [] && $as !== null) {
-                $this->activity->shift($shift, $as, $changes);
-            }
 
             return $shift;
         });
@@ -192,12 +161,6 @@ class ShiftService
                 );
 
             $deleted = (int) $query->delete();
-
-            $this->activity->shift($shift, ActivityAction::Deleted, [], [
-                'rule' => $rule,
-                'rows_deleted' => $deleted,
-                'series_id' => $shift->series_id,
-            ]);
 
             // A mass soft delete leaves the passed model stale; say so in
             // memory so a caller's ->trashed() is not a lie.
@@ -279,12 +242,6 @@ class ShiftService
                 'created_by_user_id' => $shift->created_by_user_id,
             ]);
 
-            $this->activity->shift($part, ActivityAction::Split, [], [
-                'split_group_id' => $shift->split_group_id,
-                'split_part' => $part->split_part,
-                'from_shift_id' => (int) $shift->id,
-            ]);
-
             return $part;
         });
     }
@@ -331,25 +288,7 @@ class ShiftService
             $attributes['employee_id'] = $employeeId === null ? null : (int) $employeeId;
         }
 
-        $from = [
-            'business_date' => $this->dateString($shift->business_date),
-            'employee_id' => $shift->employee_id === null ? null : (int) $shift->employee_id,
-        ];
-
-        // null: one drag is one line. move() records the move below; letting
-        // update() also log would put the same action in the trail twice.
-        $moved = $this->update($shift, $attributes, null);
-
-        $this->activity->shift($moved, ActivityAction::Moved, array_filter([
-            'business_date' => $from['business_date'] === $this->dateString($moved->business_date)
-                ? null
-                : ['from' => $from['business_date'], 'to' => $this->dateString($moved->business_date)],
-            'employee_id' => $from['employee_id'] === ($moved->employee_id === null ? null : (int) $moved->employee_id)
-                ? null
-                : ['from' => $from['employee_id'], 'to' => $moved->employee_id === null ? null : (int) $moved->employee_id],
-        ]));
-
-        return $moved;
+        return $this->update($shift, $attributes);
     }
 
     /**
@@ -375,7 +314,7 @@ class ShiftService
             ? CarbonImmutable::parse($targetDate)->addDay()->toDateString()
             : $targetDate;
 
-        $copy = $this->create([
+        return $this->create([
             'store_id' => $storeId,
             'employee_id' => $employeeId === false
                 ? ($shift->employee_id === null ? null : (int) $shift->employee_id)
@@ -392,12 +331,7 @@ class ShiftService
             'split_group_id' => null,
             'split_part' => null,
             'created_by_user_id' => $shift->created_by_user_id,
-        ], ActivityAction::Copied, [
-            'copied_from_shift_id' => (int) $shift->id,
-            'copied_from_business_date' => $this->dateString($shift->business_date),
         ]);
-
-        return $copy;
     }
 
     /**

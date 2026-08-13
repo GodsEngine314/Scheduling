@@ -1,9 +1,9 @@
 <?php
 
-use App\Enums\ActivityAction;
-use App\Models\ActivityLog;
+use App\Models\Employee;
 use App\Models\IntegrationIdentity;
 use App\Models\Shift;
+use App\Models\WorkSegment;
 use App\Services\Scheduling\SchedulePublisher;
 use App\Support\BusinessDay;
 use Database\Seeders\DemoSeeder;
@@ -98,6 +98,101 @@ function hitPath(string $method, string $path): Closure
 }
 
 const SHIFTS_PATH = '/api/v2/shifts';
+
+const WORKSEGMENTS_PATH = '/v1/worksegments';
+
+// ── the two directions never cross ──────────────────────────────────────
+
+it('publishing sends planned shifts to Humanity and never touches TCP worksegments', function () {
+    fakeHumanity();
+
+    // The seeded day has both planned shifts AND worked hours against them.
+    expect(WorkSegment::count())->toBeGreaterThan(0);
+
+    $this->post('/board/publish', [
+        'store_id' => DemoSeeder::STORE_ID, 'from' => $this->today, 'to' => $this->today,
+    ])->assertRedirect();
+
+    Http::assertSent(hitPath('POST', SHIFTS_PATH));
+
+    // Publishing is about the PLAN. Worked hours are TCP's record of what
+    // happened and have no business being pushed anywhere as a schedule.
+    Http::assertNotSent(fn ($r) => str_contains((string) parse_url($r->url(), PHP_URL_PATH), 'worksegment'));
+    Http::assertNotSent(fn ($r) => str_contains($r->url(), 'tcplusondemand'));
+});
+
+it('publishing never changes a work segment row either', function () {
+    fakeHumanity();
+
+    $before = WorkSegment::orderBy('id')->get()
+        ->map(fn (WorkSegment $w) => [$w->id, $w->time_in?->toIso8601String(), $w->time_out?->toIso8601String(),
+            (bool) $w->manager_approval, $w->tcp_sync_state?->value])
+        ->all();
+
+    $this->post('/board/publish', [
+        'store_id' => DemoSeeder::STORE_ID, 'from' => $this->today, 'to' => $this->today,
+    ])->assertRedirect();
+
+    $after = WorkSegment::orderBy('id')->get()
+        ->map(fn (WorkSegment $w) => [$w->id, $w->time_in?->toIso8601String(), $w->time_out?->toIso8601String(),
+            (bool) $w->manager_approval, $w->tcp_sync_state?->value])
+        ->all();
+
+    expect($after)->toBe($before);
+});
+
+it('pulls actual hours from TCP with a GET, and sends nothing to Humanity', function () {
+    config()->set('tcp.auth_mode', 'static');
+    config()->set('tcp.static_token', 'tok');
+
+    // The sync filters GET /worksegments by TCP employee id. With none set it
+    // correctly refuses to run rather than widening a one-store pull into every
+    // store's punches — so the fixture has to supply them.
+    Employee::query()->update(['tcp_employee_id' => null]);
+    foreach (Employee::all() as $i => $employee) {
+        $employee->forceFill(['tcp_employee_id' => 'TCP-'.$employee->id])->save();
+    }
+
+    Http::fake(['*' => Http::response(['data' => []], 200)]);
+
+    $this->post('/board/pull-segments', [
+        'store_id' => DemoSeeder::STORE_ID,
+        'date' => $this->today,
+    ])->assertRedirect();
+
+    // GET, per the document: "GET action request to .../v1/worksegments".
+    Http::assertSent(fn ($r) => $r->method() === 'GET'
+        && str_contains((string) parse_url($r->url(), PHP_URL_PATH), 'worksegments'));
+
+    // And nothing at all to Humanity: the plan is not derived from the punches.
+    Http::assertNotSent(fn ($r) => str_contains($r->url(), 'humanity.com'));
+});
+
+it('does not create or update a planned shift when actual hours are pulled', function () {
+    config()->set('tcp.auth_mode', 'static');
+    config()->set('tcp.static_token', 'tok');
+    Http::fake(['*' => Http::response(['data' => []], 200)]);
+
+    $before = Shift::orderBy('id')->get()
+        ->map(fn (Shift $s) => [$s->id, $s->publish_state->value, $s->humanity_shift_id, $s->payload_fingerprint])
+        ->all();
+
+    $this->post('/board/pull-segments', [
+        'store_id' => DemoSeeder::STORE_ID, 'date' => $this->today,
+    ])->assertRedirect();
+
+    expect(Shift::orderBy('id')->get()
+        ->map(fn (Shift $s) => [$s->id, $s->publish_state->value, $s->humanity_shift_id, $s->payload_fingerprint])
+        ->all())->toBe($before);
+});
+
+it('offers both directions on the board, labelled for the right system', function () {
+    $response = $this->get('/board?store='.DemoSeeder::STORE_ID)->assertOk();
+
+    $response->assertSee('Publish this day')          // out, to Humanity
+        ->assertSee('Pull actual hours from TCP')     // in, from TCP
+        ->assertSee('GET /worksegments', false);
+});
 
 // ── nothing leaves until publish ────────────────────────────────────────
 
@@ -234,30 +329,6 @@ it('refuses to unpublish something that was never published', function () {
         ->and($draft->fresh()->publish_state->value)->toBe('draft');
 });
 
-// ── the audit trail records the verb ────────────────────────────────────
-
-it('records publish with the HTTP verb, and unpublish separately', function () {
-    fakeHumanity();
-
-    $shift = Shift::where('publish_state', 'draft')->whereNotNull('employee_id')->firstOrFail();
-    $this->post('/board/publish', [
-        'store_id' => DemoSeeder::STORE_ID, 'from' => $this->today, 'to' => $this->today,
-    ])->assertRedirect();
-
-    $published = ActivityLog::where('action', ActivityAction::Published)
-        ->where('subject_id', $shift->id)->latest('id')->firstOrFail();
-
-    expect($published->context['method'])->toBe('POST');
-
-    $this->post("/board/shifts/{$shift->id}/unpublish")->assertRedirect();
-
-    $unpublished = ActivityLog::where('action', ActivityAction::Unpublished)
-        ->where('subject_id', $shift->id)->latest('id')->firstOrFail();
-
-    expect($unpublished->changed_fields['publish_state']['to'])->toBe('unlocked')
-        ->and($unpublished->context['humanity_shift_id'])->not->toBeNull();
-});
-
 // ── the API surface agrees with the board ───────────────────────────────
 
 it('publishes over the API too', function () {
@@ -286,7 +357,7 @@ it('unpublishes over the API too', function () {
 });
 
 it('approves a single segment over the API, which had no way to at all', function () {
-    $segment = \App\Models\WorkSegment::whereNotNull('time_out')
+    $segment = WorkSegment::whereNotNull('time_out')
         ->where('manager_approval', false)->firstOrFail();
 
     $this->postJson("/api/work-segments/{$segment->id}/approve")->assertOk();

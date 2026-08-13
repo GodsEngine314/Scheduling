@@ -5,14 +5,13 @@ namespace App\Http\Controllers;
 use App\Enums\PublishState;
 use App\Enums\RequestDecision;
 use App\Exceptions\SchedulingException;
+use App\Models\Employee;
 use App\Models\EmployeeRequest;
-use App\Models\ActivityLog;
 use App\Models\Position;
 use App\Models\Shift;
 use App\Models\Store;
 use App\Models\User;
 use App\Models\WorkSegment;
-use App\Models\Employee;
 use App\Services\Scheduling\BoardService;
 use App\Services\Scheduling\DayCloseService;
 use App\Services\Scheduling\EmployeeRequestService;
@@ -20,11 +19,12 @@ use App\Services\Scheduling\LaborCostEstimator;
 use App\Services\Scheduling\SchedulePublisher;
 use App\Services\Scheduling\ShiftService;
 use App\Services\Scheduling\WorkSegmentService;
+use App\Services\Scheduling\WorkSegmentSyncService;
 use App\Support\ActingUser;
 use App\Support\BusinessDay;
-use Database\Seeders\DemoSeeder;
 use Carbon\CarbonImmutable;
 use Carbon\CarbonInterface;
+use Database\Seeders\DemoSeeder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -51,6 +51,7 @@ class BoardController extends Controller
         private readonly DayCloseService $dayClose,
         private readonly LaborCostEstimator $costs,
         private readonly SchedulePublisher $publisher,
+        private readonly WorkSegmentSyncService $segmentSync,
         private readonly BusinessDay $businessDay,
         private readonly ActingUser $actingUser,
     ) {}
@@ -166,25 +167,7 @@ class BoardController extends Controller
             'positions' => Position::query()->orderBy('id')->get(),
             'costs' => $this->costs->estimateFor($shifts, $storeId, null),
             'publishable' => $this->publisher->pendingInRange($storeId, $days->first(), $days->last())->count(),
-            'activity' => ActivityLog::query()
-                ->forStore($storeId)
-                ->coveringDates($days->first(), $days->last())
-                ->limit(40)
-                ->get(),
             'timezone' => $this->businessDay->timezoneFor($storeId),
-        ]);
-    }
-
-    /** The full history, newest first. */
-    public function activity(Request $request): View
-    {
-        $stores = Store::query()->orderBy('id')->get();
-        $storeId = (int) ($request->query('store') ?: $stores->first()?->id ?: DemoSeeder::STORE_ID);
-
-        return view('board.activity', [
-            'stores' => $stores,
-            'storeId' => $storeId,
-            'entries' => ActivityLog::query()->forStore($storeId)->limit(300)->get(),
         ]);
     }
 
@@ -246,7 +229,73 @@ class BoardController extends Controller
 
     private function dateOf(mixed $date): string
     {
-        return $date instanceof \Carbon\CarbonInterface ? $date->toDateString() : (string) $date;
+        return $date instanceof CarbonInterface ? $date->toDateString() : (string) $date;
+    }
+
+    /**
+     * Pull the day's ACTUAL hours from TCP.
+     *
+     * The counterpart to publish, and the direction matters:
+     *
+     *   PLANNED shifts go OUT to Humanity   (POST/PUT /shifts)
+     *   ACTUAL hours come IN from TCP       (GET /worksegments)
+     *
+     * Nothing crosses over. A planned shift is never sent to TCP as worked time,
+     * and a punch is never sent to Humanity as a plan. The only writes back to
+     * TCP are the document's own correction workflows — approve, change times,
+     * create-for-a-missed-clock-in, delete — each on a single segment a manager
+     * touched, never a batch.
+     *
+     * Idempotent: the upsert is keyed on tcp_segment_id, so re-pulling a day
+     * costs a request and changes nothing.
+     */
+    public function pullSegments(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'store_id' => ['required', 'integer', 'exists:stores,id'],
+            'date' => ['required', 'date_format:Y-m-d'],
+        ]);
+
+        try {
+            $result = $this->segmentSync->syncDate($data['date'], (int) $data['store_id']);
+        } catch (Throwable $e) {
+            return back()->with('err', 'TCP pull failed — '.class_basename($e).': '.$e->getMessage());
+        }
+
+        $parts = [];
+        foreach (['created', 'updated', 'unchanged', 'held'] as $key) {
+            if ((int) ($result[$key] ?? 0) > 0) {
+                $parts[] = $result[$key].' '.$key;
+            }
+        }
+
+        $message = ((int) ($result['fetched'] ?? 0) === 0)
+            ? 'TCP returned no punches for '.$data['date'].'.'
+            : 'Pulled '.$result['fetched'].' from TCP for '.$data['date']
+                .($parts === [] ? '' : ': '.implode(', ', $parts)).'.';
+
+        // 'held' is not a failure but it is not silence either: TCP disagreed
+        // with a row a human had already approved or corrected, and we kept
+        // ours. Somebody should know the two systems differ.
+        if ((int) ($result['held'] ?? 0) > 0) {
+            $message .= ' Held rows kept the local approval or correction over the TCP version.';
+        }
+
+        // skipped is a LIST of reasons, not a count. Rows TCP sent that we
+        // refused — reporting a clean pull would hide them.
+        $skipped = $result['skipped'] ?? [];
+
+        if ($skipped !== []) {
+            $why = collect($skipped)
+                ->map(fn ($row) => is_array($row) ? ($row['reason'] ?? 'unknown') : (string) $row)
+                ->countBy()
+                ->map(fn (int $n, string $reason) => "{$reason} ×{$n}")
+                ->join(', ');
+
+            return back()->with('err', $message.' Skipped: '.$why.'.');
+        }
+
+        return back()->with('ok', $message);
     }
 
     /**
@@ -475,7 +524,7 @@ class BoardController extends Controller
         // Compare against part 1's OWN business_date, not the day it ends on.
         // Those differ precisely when part 1 already crosses midnight, which is
         // the case most likely to strand part 2 on a date nobody is looking at.
-        $part1Day = $shift->business_date instanceof \Carbon\CarbonInterface
+        $part1Day = $shift->business_date instanceof CarbonInterface
             ? $shift->business_date->toDateString()
             : (string) $shift->business_date;
         $sameDay = $newDay === $part1Day;
@@ -535,7 +584,7 @@ class BoardController extends Controller
         return $this->attempt(
             $request,
             fn () => $this->segments->correctTimes($segment, null, $out),
-            "Clocked out. The hours are now approvable.",
+            'Clocked out. The hours are now approvable.',
         );
     }
 

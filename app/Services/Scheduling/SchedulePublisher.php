@@ -2,7 +2,6 @@
 
 namespace App\Services\Scheduling;
 
-use App\Enums\ActivityAction;
 use App\Enums\IntegrationEntityType;
 use App\Enums\IntegrationSystem;
 use App\Enums\PublishState;
@@ -10,7 +9,6 @@ use App\Exceptions\IntegrationException;
 use App\Exceptions\SchedulingException;
 use App\Models\IntegrationIdentity;
 use App\Models\Shift;
-use App\Services\ActivityLogger;
 use App\Support\BusinessDay;
 use App\Support\Integrations\Humanity\HumanityClient;
 use Illuminate\Database\Eloquent\Builder;
@@ -72,7 +70,6 @@ class SchedulePublisher
     public function __construct(
         private readonly HumanityClient $humanity,
         private readonly BusinessDay $businessDay,
-        private readonly ActivityLogger $activity,
     ) {}
 
     /**
@@ -307,16 +304,7 @@ class SchedulePublisher
         }
 
         return DB::transaction(function () use ($shift): Shift {
-            $was = $shift->publish_state;
-
             $shift->forceFill(['publish_state' => PublishState::Unlocked])->save();
-
-            $this->activity->shift($shift, ActivityAction::Unpublished, [
-                'publish_state' => ['from' => $was?->value, 'to' => PublishState::Unlocked->value],
-            ], [
-                'humanity_shift_id' => $shift->humanity_shift_id,
-                'note' => 'Still live in Humanity; the next publish sends a PUT.',
-            ]);
 
             return $shift;
         });
@@ -535,11 +523,7 @@ class SchedulePublisher
 
     private function recordSuccess(Shift $shift, string $humanityShiftId, string $fingerprint): void
     {
-        // Was this the first POST or a PUT over an existing shift? Read before
-        // the write, because the state is about to become Published either way.
-        $wasLive = (bool) $shift->publish_state?->isLive();
-
-        DB::transaction(function () use ($shift, $humanityShiftId, $fingerprint, $wasLive): void {
+        DB::transaction(function () use ($shift, $humanityShiftId, $fingerprint): void {
             $shift->forceFill([
                 'humanity_shift_id' => $humanityShiftId,
                 'payload_fingerprint' => $fingerprint,
@@ -552,13 +536,6 @@ class SchedulePublisher
                 // only ever grows.
                 'publish_attempts' => 0,
             ])->save();
-
-            // The moment a shift went live, and by which verb. This is the line
-            // someone reads when asking "when did the employee first see this?"
-            $this->activity->shift($shift, ActivityAction::Published, [], [
-                'humanity_shift_id' => $humanityShiftId,
-                'method' => $wasLive ? 'PUT' : 'POST',
-            ]);
         });
     }
 

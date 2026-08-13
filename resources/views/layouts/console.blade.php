@@ -172,7 +172,6 @@
     <nav class="topbar-nav">
       <a href="{{ route('board') }}" class="{{ request()->routeIs('board') ? 'on' : '' }}">Day</a>
       <a href="{{ route('board.week') }}" class="{{ request()->routeIs('board.week') ? 'on' : '' }}">Week</a>
-      <a href="{{ route('board.activity') }}" class="{{ request()->routeIs('board.activity') ? 'on' : '' }}">Activity</a>
     </nav>
 
     <form method="POST" action="{{ route('acting-user') }}" class="ctl" style="gap:8px;align-items:center">

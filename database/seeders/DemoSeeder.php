@@ -80,6 +80,12 @@ class DemoSeeder extends Seeder
                 'updated_at' => now(),
             ]);
 
+            // wipe() above clears every store, so the roster has to come back
+            // after it or reseeding the demo would quietly delete 38 real
+            // stores. The demo scenario itself stays on STORE_ID alone; these
+            // arrive empty, which is what an unstaffed store looks like.
+            $this->call(StoreSeeder::class);
+
             $driver = Position::query()->create(['label' => 'Driver']);
             $insider = Position::query()->create(['label' => 'Insider']);
             $lead = Position::query()->create(['label' => 'Shift Lead']);

@@ -3,10 +3,7 @@
 namespace App\Services\Scheduling;
 
 use App\Exceptions\SchedulingException;
-use App\Enums\ActivityAction;
-use App\Enums\ActivitySubject;
 use App\Models\WorkSegment;
-use App\Services\ActivityLogger;
 use Illuminate\Support\Collection;
 
 /**
@@ -23,13 +20,13 @@ use Illuminate\Support\Collection;
  * Both name the employees, because "3 unapproved segments" is not something a
  * manager can act on and "Dana Okafor, still clocked in since 13:02" is.
  *
- * There is no day_closes table yet, and emitting the close through the outbox
- * belongs to whoever owns the outbox. close() validates and reports.
+ * There is no day_closes table, and emitting the close through the outbox
+ * belongs to whoever owns the outbox. close() validates and reports, and
+ * PERSISTS NOTHING — a closed day leaves no trace in the database at all, so it
+ * neither locks the date against later edits nor records that anyone closed it.
  */
 class DayCloseService
 {
-    public function __construct(private readonly ActivityLogger $activity) {}
-
     /**
      * @return array{
      *     store_id: int,
@@ -93,21 +90,10 @@ class DayCloseService
             throw SchedulingException::dayNotClosable($storeId, $businessDate, $result['blockers']);
         }
 
-        $closed = array_merge($result, [
+        return array_merge($result, [
             'closed_at' => now()->toIso8601String(),
             'closed_by_user_id' => $userId,
         ]);
-
-        // subject_id stays null: a day close is about a date, not a row.
-        $this->activity->record(
-            ActivitySubject::Day,
-            ActivityAction::DayClosed,
-            null,
-            $storeId,
-            $businessDate,
-        );
-
-        return $closed;
     }
 
     /**

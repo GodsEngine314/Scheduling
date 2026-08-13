@@ -23,7 +23,6 @@ Route::post('/acting-user', [BoardController::class, 'setActingUser'])->name('ac
 
 Route::get('/board', [BoardController::class, 'index'])->name('board');
 Route::get('/board/week', [BoardController::class, 'week'])->name('board.week');
-Route::get('/board/activity', [BoardController::class, 'activity'])->name('board.activity');
 
 Route::post('/board/shifts', [BoardController::class, 'storeShift'])->name('board.shifts.store');
 Route::put('/board/shifts/{shift}', [BoardController::class, 'updateShift'])->name('board.shifts.update');
@@ -32,6 +31,10 @@ Route::post('/board/shifts/{shift}/split', [BoardController::class, 'splitShift'
 // Drag and drop targets. JSON in, JSON out — the grid posts and reloads.
 Route::post('/board/shifts/{shift}/move', [BoardController::class, 'moveShift'])->name('board.shifts.move');
 Route::post('/board/shifts/{shift}/copy', [BoardController::class, 'copyShift'])->name('board.shifts.copy');
+// Pull ACTUAL hours from TCP. The other half of the split: planned shifts go
+// out to Humanity, worked hours come in from TCP. Neither crosses over.
+Route::post('/board/pull-segments', [BoardController::class, 'pullSegments'])->name('board.pull-segments');
+
 // Publish the visible range to Humanity, and unlock one shift for editing.
 // Nothing reaches Humanity until the first of these is pressed.
 Route::post('/board/publish', [BoardController::class, 'publish'])->name('board.publish');

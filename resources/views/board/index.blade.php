@@ -71,6 +71,26 @@
       'publishable' => $publishable, 'label' => 'this day',
   ])
 
+  {{-- The other direction. Planned shifts go OUT to Humanity; worked hours come
+       IN from TCP. Two buttons, two systems, no crossover. --}}
+  <div class="card pad grow" style="border-left:4px solid var(--actual)">
+    <div class="lbl">TCP</div>
+    <div style="font-family:var(--mono);font-weight:700;font-size:13px;color:var(--actual)">
+      Actual hours
+    </div>
+    <p class="note" style="margin:2px 0 8px">
+      Pulled with <code>GET /worksegments</code>, filtered to this store and date.
+      Re-pulling is free: the upsert is keyed on <code>tcp_segment_id</code>, and a
+      row a manager has already approved or corrected is held rather than overwritten.
+    </p>
+    <form method="POST" action="{{ route('board.pull-segments') }}" class="inline">
+      @csrf
+      <input type="hidden" name="store_id" value="{{ $storeId }}">
+      <input type="hidden" name="date" value="{{ $date }}">
+      <button class="primary">Pull actual hours from TCP</button>
+    </form>
+  </div>
+
   <div class="card pad grow" style="border-left:4px solid {{ $board['day_close']['closable'] ? 'var(--ok)' : 'var(--crit)' }}">
     <div class="lbl">Day close</div>
     @if ($board['day_close']['closable'])
@@ -307,7 +327,9 @@
                     data-end-day="{{ $bd->toLocal($storeId, $s->end_at)->toDateString() }}"
                     data-business-date="{{ $s->business_date instanceof \Carbon\CarbonInterface ? $s->business_date->toDateString() : $s->business_date }}"
                     onclick="openSplit(this)">split</button>
-            <form method="POST" action="{{ route('board.shifts.punch-in', $s) }}" class="inline">@csrf<button class="mini">punch in</button></form>
+            {{-- Fabricates a punch locally so the day-close gate can be exercised
+                 without a live TCP. Real hours arrive via GET /worksegments. --}}
+            <form method="POST" action="{{ route('board.shifts.punch-in', $s) }}" class="inline">@csrf<button class="mini" title="Simulates a clock-in. Real punches come from TCP.">sim punch in</button></form>
             <form method="POST" action="{{ route('board.shifts.destroy', $s) }}" class="inline">
               @csrf @method('DELETE')<button class="mini danger">del</button>
             </form>
@@ -389,7 +411,7 @@
           <td>
             <button class="mini" type="button" onclick="document.getElementById('edit-seg-{{ $g->id }}').hidden = !document.getElementById('edit-seg-{{ $g->id }}').hidden">edit</button>
             @if ($g->time_out === null)
-              <form method="POST" action="{{ route('board.segments.punch-out', $g) }}" class="inline">@csrf<button class="mini">punch out</button></form>
+              <form method="POST" action="{{ route('board.segments.punch-out', $g) }}" class="inline">@csrf<button class="mini" title="Simulates a clock-out. Real punches come from TCP.">sim punch out</button></form>
             @elseif (! $g->manager_approval)
               <form method="POST" action="{{ route('board.segments.approve', $g) }}" class="inline">@csrf<button class="mini">approve</button></form>
             @endif

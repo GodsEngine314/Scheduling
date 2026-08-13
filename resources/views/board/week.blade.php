@@ -149,8 +149,6 @@
   </p>
 </div>
 
-@include('board._activity', ['entries' => $activity, 'heading' => 'Activity this week'])
-
 <div id="drag-flash" class="flash err" hidden style="position:sticky;bottom:12px"></div>
 
 <script>
@@ -230,7 +228,7 @@
 
         if (res.ok && payload.ok) {
           // Reload rather than patch the DOM: the server owns cost totals,
-          // availability flags and the activity list, and re-deriving them
+          // availability flags and the conflict warnings, and re-deriving them
           // here would be a second implementation to keep in step.
           location.reload();
           return;

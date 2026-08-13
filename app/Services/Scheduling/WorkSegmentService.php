@@ -2,14 +2,12 @@
 
 namespace App\Services\Scheduling;
 
-use App\Enums\ActivityAction;
 use App\Enums\MatchSource;
 use App\Enums\SegmentOrigin;
 use App\Enums\TcpSyncState;
 use App\Exceptions\SchedulingException;
 use App\Jobs\PushWorkSegmentToTcp;
 use App\Models\WorkSegment;
-use App\Services\ActivityLogger;
 use App\Support\BusinessDay;
 use Carbon\CarbonImmutable;
 use Carbon\CarbonInterface;
@@ -43,7 +41,6 @@ class WorkSegmentService
     public function __construct(
         private readonly BusinessDay $businessDay,
         private readonly ReconciliationService $reconciliation,
-        private readonly ActivityLogger $activity,
     ) {}
 
     /**
@@ -96,7 +93,6 @@ class WorkSegmentService
             ));
 
             $this->reconciliation->match($segment);
-            $this->activity->workSegment($segment, ActivityAction::Created, [], ['origin' => 'manual_create']);
             $this->pushToTcp($segment);
 
             return $segment;
@@ -124,10 +120,6 @@ class WorkSegmentService
                 'approved_at' => now(),
                 'tcp_sync_state' => TcpSyncState::Pending,
             ])->save();
-
-            $this->activity->workSegment($segment, ActivityAction::Approved, [], [
-                'hours' => $segment->hours === null ? null : (float) $segment->hours,
-            ]);
 
             // "Approving Hours ... PUT /worksegments/{id}". An approval that
             // never reaches TCP means payroll pays from a number the timeclock
@@ -177,11 +169,7 @@ class WorkSegmentService
             ]);
         }
 
-        // Read before the write, or the diff records the new value twice.
-        $wasIn = $segment->time_in?->toIso8601String();
-        $wasOut = $segment->time_out?->toIso8601String();
-
-        return DB::transaction(function () use ($segment, $newIn, $newOut, $reapprove, $userId, $wasIn, $wasOut): WorkSegment {
+        return DB::transaction(function () use ($segment, $newIn, $newOut, $reapprove, $userId): WorkSegment {
             $storeId = (int) $segment->store_id;
             $breakMinutes = (int) $segment->break_minutes;
 
@@ -204,11 +192,6 @@ class WorkSegmentService
             // timeIn and timeOut."
             $segment->forceFill(['tcp_sync_state' => TcpSyncState::Pending])->save();
 
-            $this->activity->workSegment($segment, ActivityAction::Corrected, [
-                'time_in' => ['from' => $wasIn, 'to' => $segment->time_in?->toIso8601String()],
-                'time_out' => ['from' => $wasOut, 'to' => $segment->time_out?->toIso8601String()],
-            ], ['reapproved' => $reapprove]);
-
             $this->pushToTcp($segment);
 
             return $segment;
@@ -220,10 +203,6 @@ class WorkSegmentService
     {
         return (bool) DB::transaction(function () use ($segment): bool {
             $deleted = (bool) $segment->delete();
-
-            if ($deleted) {
-                $this->activity->workSegment($segment, ActivityAction::Deleted);
-            }
 
             // "Deleting Shifts ... DEL /worksegments/{id}". The job reads the
             // row withTrashed and sends the delete; a row TCP never saw is a
