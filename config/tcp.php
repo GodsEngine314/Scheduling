@@ -21,7 +21,9 @@ return [
     'auth_mode' => env('TCP_AUTH_MODE', 'oauth'),
 
     'oauth' => [
-        'token_path' => env('TCP_TOKEN_PATH', '/token'),
+        // CONFIRMED by the workflow document: a different host from base_uri,
+        // so this is an absolute URL and TokenProvider honours it as one.
+        'token_path' => env('TCP_TOKEN_PATH', 'https://auth.api.tcplusondemand.com/oauth2/token'),
         'grant_type' => 'client_credentials',
         'client_id' => env('TCP_CLIENT_ID'),
         'client_secret' => env('TCP_CLIENT_SECRET'),

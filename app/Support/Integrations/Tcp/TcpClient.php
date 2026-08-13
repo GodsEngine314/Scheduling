@@ -182,22 +182,33 @@ class TcpClient extends AbstractApiClient
     }
 
     /**
-     * Pull the list of records out of whatever envelope a response arrived in.
+     * Pull the list of records out of the response envelope.
      *
-     * SCAFFOLDING, NOT DESIGN. No live TCP response has been seen, so the
-     * three envelope spellings that vendors actually use plus a bare list are
-     * all accepted. Once a real payload is captured this should collapse to
-     * the one key TCP really sends, and the rest should go.
+     * CONFIRMED: TCP answers {data, errors, meta}. A collection endpoint puts a
+     * LIST in data; a by-id endpoint puts a single OBJECT there, which is
+     * wrapped so both shapes read the same to a caller.
+     *
+     * The `results` / `items` / bare-list spellings this used to accept were
+     * scaffolding for an unseen payload and are gone. The fallback below is
+     * kept only because a proxy or an error page can still put something else
+     * on the wire.
      *
      * @param  array<mixed>  $response
      * @return array<int,array<string,mixed>>
      */
     public function records(array $response): array
     {
-        foreach (['data', 'results', 'items'] as $key) {
-            if (isset($response[$key]) && is_array($response[$key])) {
-                return array_values(array_filter($response[$key], 'is_array'));
+        if (array_key_exists('data', $response)) {
+            $data = $response['data'];
+
+            if (! is_array($data)) {
+                return [];
             }
+
+            // A by-id response: one record, not a list of them.
+            return array_is_list($data)
+                ? array_values(array_filter($data, 'is_array'))
+                : [$data];
         }
 
         if ($response === []) {

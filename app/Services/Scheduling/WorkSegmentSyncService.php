@@ -426,6 +426,8 @@ class WorkSegmentSyncService
             $timeOut = null;
         }
 
+        $breakMinutes = $this->breakMinutes($this->pick($fields, ['breakLength', 'break_length']));
+
         return new WorkSegmentData(
             employeeId: (int) $employee->id,
             storeId: $storeId,
@@ -434,20 +436,77 @@ class WorkSegmentSyncService
             timeOut: $timeOut?->format('Y-m-d H:i:s'),
             tcpSegmentId: $tcpSegmentId,
             positionId: $this->resolvePositionId($fields),
-            breakMinutes: (int) ($this->pick($fields, ['breakMinutes', 'break_minutes', 'breakTime', 'break_time', 'break']) ?? 0),
-            // TCP's own figure, never a subtraction of the two times. When the
-            // two disagree, payroll needs TCP's.
-            hours: $this->numeric($this->pick($fields, ['hours', 'totalHours', 'total_hours', 'hoursWorked', 'hours_worked'])),
-            costCodeName: $this->string($this->pick($fields, ['costCodeName', 'cost_code_name', 'costCode', 'cost_code'])),
-            laborCode: $this->string($this->pick($fields, ['laborCode', 'labor_code', 'laborCodeName', 'labor_code_name'])),
-            notes: $this->string($this->pick($fields, ['notes', 'note', 'comment', 'comments'])),
+            breakMinutes: $breakMinutes,
+            // DERIVED, and it has to be. The response schema carries no hours
+            // field of any spelling — the old comment here claimed this was
+            // "TCP's own figure, never a subtraction of the two times", which
+            // was true of the guess and is not true of the real payload. An
+            // open punch stays null; a closed one is the block less the break.
+            hours: $this->hoursBetween($timeIn, $timeOut, $breakMinutes),
+            costCodeName: $this->string($this->pick($fields, ['costCode', 'cost_code'])),
+            // laborCodes is a LIST. work_segments.labor_code is one string, so
+            // a segment carrying several is joined rather than silently
+            // truncated to the first — losing one would understate the split.
+            laborCode: $this->joined($this->pick($fields, ['laborCodes', 'labor_codes'])),
+            // shiftNotes is a LIST too, one note per line.
+            notes: $this->joined($this->pick($fields, ['shiftNotes', 'shift_notes']), "\n"),
             tcpUpdatedOn: $this->parseUtc($this->string($this->pick($fields, [
-                'updatedOn', 'updated_on', 'lastModified', 'last_modified', 'modifiedOn', 'modified_on', 'updatedAt', 'updated_at',
+                'updatedOnDateTime', 'updated_on_date_time',
             ])))?->format('Y-m-d H:i:s'),
-            // The whole raw record, exactly as it arrived. The mapping above is
-            // unconfirmed; this is what makes a wrong guess recoverable.
+            // The whole raw record, exactly as it arrived. Several fields have
+            // no column yet — approvals[], tracked1-3, punchIn/OutInformation,
+            // geoLocations[], scheduleOrg, missedIn/OutPunch, actualTimeIn/Out,
+            // customFields[] — and this is where they stay readable until they
+            // earn one.
             tcpPayload: $record,
         );
+    }
+
+    /**
+     * TCP's breakLength as whole minutes.
+     *
+     * GUESS: the field is typed as a string in the response schema with no
+     * example, so both a plain count of minutes ("30") and a clock duration
+     * ("00:30" / "0:30:00") are accepted. Anything else is 0 rather than a
+     * fatal — the raw value survives on tcp_payload either way.
+     */
+    private function breakMinutes(mixed $value): int
+    {
+        $raw = $this->string($value);
+
+        if ($raw === null) {
+            return 0;
+        }
+
+        if (str_contains($raw, ':')) {
+            $parts = array_map('intval', explode(':', $raw));
+
+            // h:m or h:m:s — seconds are dropped, not rounded. A break is
+            // recorded to the minute everywhere else in this schema.
+            return ($parts[0] * 60) + ($parts[1] ?? 0);
+        }
+
+        return is_numeric($raw) ? (int) round((float) $raw) : 0;
+    }
+
+    /**
+     * A TCP list field as one string, or null when there is nothing in it.
+     *
+     * laborCodes and shiftNotes both arrive as arrays. Each maps onto a single
+     * column here, so the whole list is kept rather than its first element.
+     */
+    private function joined(mixed $value, string $glue = ', '): ?string
+    {
+        if (! is_array($value)) {
+            return $this->string($value);
+        }
+
+        $parts = array_values(array_filter(array_map(
+            fn (mixed $item): ?string => $this->string($item),
+            $value,
+        )));
+
+        return $parts === [] ? null : implode($glue, $parts);
     }
 
     /**
@@ -462,7 +521,16 @@ class WorkSegmentSyncService
      */
     private function resolveStoreId(array $fields, Employee $employee, ?int $requestedStoreId): ?int
     {
-        $external = $this->string($this->pick($fields, ['locationId', 'location_id', 'location', 'siteId', 'site_id']));
+        // employeeDefaultLocationId is what the real payload carries, and the
+        // name is a warning: it is the employee's DEFAULT location, not
+        // necessarily where this punch happened. It is still the best evidence
+        // on the record, but it weakens the precedence below rather than
+        // settling it — somebody covering another store will be filed against
+        // their home store until TCP tells us otherwise.
+        $external = $this->string($this->pick($fields, [
+            'employeeDefaultLocationId', 'employee_default_location_id',
+            'locationId', 'location_id', 'location', 'siteId', 'site_id',
+        ]));
 
         if ($external !== null) {
             $entityId = IntegrationIdentity::query()
@@ -706,9 +774,23 @@ class WorkSegmentSyncService
         return $string === '' ? null : $string;
     }
 
-    private function numeric(mixed $value): ?float
+    /**
+     * Paid hours for a punch: the block, less the break.
+     *
+     * Derived here because TCP does not send an hours field — deliberately the
+     * same arithmetic as WorkSegmentService::hoursBetween(), so a punch that
+     * arrives from the sync and one a manager typed are costed identically.
+     * An open punch has no hours yet, which is what null means downstream.
+     */
+    private function hoursBetween(CarbonImmutable $timeIn, ?CarbonImmutable $timeOut, int $breakMinutes): ?float
     {
-        return is_numeric($value) ? (float) $value : null;
+        if ($timeOut === null) {
+            return null;
+        }
+
+        $minutes = abs($timeIn->diffInMinutes($timeOut)) - $breakMinutes;
+
+        return round(max($minutes, 0) / 60, 2);
     }
 
     /**

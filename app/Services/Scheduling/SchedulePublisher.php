@@ -126,6 +126,16 @@ class SchedulePublisher
     {
         return Shift::query()
             ->forStoreBetween($storeId, $from, $to)
+            // A shift somebody has already punched against is not a plan any
+            // more, it is history, and history does not get pushed to a roster
+            // people read to find out when to come in.
+            //
+            // EDITING IS STILL ALLOWED — only publishing is refused, which is
+            // the asymmetry that was asked for. The consequence to know: an
+            // edit to a worked shift that Humanity already holds will now never
+            // be sent, so the two diverge permanently. That is the intended
+            // trade, not an oversight.
+            ->whereDoesntHave('workSegments')
             ->where(function (Builder $query): void {
                 $query
                     ->whereIn('publish_state', array_map(

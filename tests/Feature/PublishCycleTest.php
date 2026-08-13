@@ -99,9 +99,45 @@ function hitPath(string $method, string $path): Closure
         && parse_url($r->url(), PHP_URL_PATH) === $path;
 }
 
+/**
+ * A shift the publisher will actually pick up.
+ *
+ * A shift with punches against it is no longer publishable — it has stopped
+ * being a plan and become history — so the seeded day's worked shifts are
+ * deliberately not candidates here.
+ */
+function publishableShift(): Shift
+{
+    return Shift::query()
+        ->where('publish_state', 'draft')
+        ->whereNotNull('employee_id')
+        ->whereDoesntHave('workSegments')
+        ->orderBy('id')
+        ->firstOrFail();
+}
+
 const SHIFTS_PATH = '/api/v2/shifts';
 
 const WORKSEGMENTS_PATH = '/v1/worksegments';
+
+// ── a worked shift is not a plan any more ───────────────────────────────
+
+it('never publishes a shift that already has punches against it', function () {
+    fakeHumanity();
+
+    $worked = Shift::query()->has('workSegments')->whereNotNull('employee_id')->firstOrFail();
+
+    expect($worked->publish_state->value)->toBe('draft');
+
+    $this->post('/board/publish', [
+        'store_id' => DemoSeeder::STORE_ID, 'from' => $this->today, 'to' => $this->today,
+    ])->assertRedirect();
+
+    // Editing it is still allowed; pushing it to a roster people read to find
+    // out when to come in is not.
+    expect($worked->fresh()->publish_state->value)->toBe('draft')
+        ->and($worked->fresh()->humanity_shift_id)->toBeNull();
+});
 
 // ── the two directions never cross ──────────────────────────────────────
 
@@ -217,7 +253,7 @@ it('sends nothing to Humanity when a shift is merely created', function () {
 it('publishes the visible range as POSTs and marks them published', function () {
     fakeHumanity();
 
-    $draft = Shift::where('publish_state', 'draft')->whereNotNull('employee_id')->firstOrFail();
+    $draft = publishableShift();
 
     $this->post('/board/publish', [
         'store_id' => DemoSeeder::STORE_ID,
@@ -252,7 +288,7 @@ it('is idempotent — publishing twice sends nothing the second time', function 
 it('sends a PUT over the same Humanity shift after unpublish and edit', function () {
     fakeHumanity();
 
-    $shift = Shift::where('publish_state', 'draft')->whereNotNull('employee_id')->firstOrFail();
+    $shift = publishableShift();
     $this->post('/board/publish', [
         'store_id' => DemoSeeder::STORE_ID, 'from' => $this->today, 'to' => $this->today,
     ])->assertRedirect();
@@ -286,7 +322,7 @@ it('sends a PUT over the same Humanity shift after unpublish and edit', function
 it('leaves the shift in Humanity when it is unpublished', function () {
     fakeHumanity();
 
-    $shift = Shift::where('publish_state', 'draft')->whereNotNull('employee_id')->firstOrFail();
+    $shift = publishableShift();
     $this->post('/board/publish', [
         'store_id' => DemoSeeder::STORE_ID, 'from' => $this->today, 'to' => $this->today,
     ])->assertRedirect();
@@ -305,7 +341,7 @@ it('leaves the shift in Humanity when it is unpublished', function () {
 it('reports unchanged rather than re-sending when nothing was edited after unpublish', function () {
     fakeHumanity();
 
-    $shift = Shift::where('publish_state', 'draft')->whereNotNull('employee_id')->firstOrFail();
+    $shift = publishableShift();
     $payload = ['store_id' => DemoSeeder::STORE_ID, 'from' => $this->today, 'to' => $this->today];
     $this->post('/board/publish', $payload)->assertRedirect();
     $this->post("/board/shifts/{$shift->id}/unpublish")->assertRedirect();
@@ -323,7 +359,7 @@ it('reports unchanged rather than re-sending when nothing was edited after unpub
 });
 
 it('refuses to unpublish something that was never published', function () {
-    $draft = Shift::where('publish_state', 'draft')->firstOrFail();
+    $draft = publishableShift();
 
     $this->post("/board/shifts/{$draft->id}/unpublish")->assertRedirect();
 
@@ -348,7 +384,7 @@ it('publishes over the API too', function () {
 it('unpublishes over the API too', function () {
     fakeHumanity();
 
-    $shift = Shift::where('publish_state', 'draft')->whereNotNull('employee_id')->firstOrFail();
+    $shift = publishableShift();
     $this->post('/board/publish', [
         'store_id' => DemoSeeder::STORE_ID, 'from' => $this->today, 'to' => $this->today,
     ])->assertRedirect();

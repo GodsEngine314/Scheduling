@@ -86,7 +86,17 @@ class TokenProvider
             );
         }
 
-        $endpoint = $baseUri.'/'.ltrim($tokenPath, '/');
+        // An ABSOLUTE token_path wins over base_uri, because for both vendors
+        // the token lives on a different host from the API:
+        //
+        //   TCP       auth.api.tcplusondemand.com/oauth2/token, not api.…/v1
+        //   Humanity  www.humanity.com/oauth2/token.php, not …/api/v2
+        //
+        // Joining them would POST credentials at a path that does not exist and
+        // read the 404 as a bad grant.
+        $endpoint = Str::startsWith($tokenPath, ['http://', 'https://'])
+            ? $tokenPath
+            : $baseUri.'/'.ltrim($tokenPath, '/');
         $correlationId = (string) Str::uuid();
         $startedAt = microtime(true);
 

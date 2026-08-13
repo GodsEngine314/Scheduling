@@ -31,7 +31,10 @@ return [
     'static_token' => env('HUMANITY_STATIC_TOKEN'),
 
     'oauth' => [
-        'token_path' => env('HUMANITY_TOKEN_PATH', '/oauth2/token'),
+        // CONFIRMED by the workflow document, and note BOTH surprises: it is a
+        // different host from base_uri (no /api/v2), and it ends in .php.
+        // Absolute, so TokenProvider uses it verbatim.
+        'token_path' => env('HUMANITY_TOKEN_PATH', 'https://www.humanity.com/oauth2/token.php'),
         'grant_type' => 'password',
         'client_id' => env('HUMANITY_CLIENT_ID'),
         'client_secret' => env('HUMANITY_CLIENT_SECRET'),
