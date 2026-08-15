@@ -25,3 +25,7 @@ _ide_helper.php
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+# Vendor exports staged for the seeders. They carry employee PII
+# (names, emails, phone numbers, birthdays) and must not be committed.
+/storage/app/integrations

@@ -94,25 +94,20 @@
     </form>
   </div>
 
-  <div class="card pad grow" style="border-left:4px solid {{ $board['day_close']['closable'] ? 'var(--ok)' : 'var(--crit)' }}">
-    <div class="lbl">Day close</div>
-    @if ($board['day_close']['closable'])
-      <div style="font-family:var(--mono);font-weight:700;color:var(--ok)">Ready to close</div>
-      <p class="note" style="margin:2px 0 8px">Every segment approved, nobody still clocked in.</p>
+  {{-- Information, not a gate. There is no day or week close — this reports
+       what is outstanding so it is visible, and nothing is blocked by it. --}}
+  <div class="card pad grow" style="border-left:4px solid {{ $board['outstanding'] === [] ? 'var(--ok)' : 'var(--warn)' }}">
+    <div class="lbl">Outstanding hours</div>
+    @if ($board['outstanding'] === [])
+      <div style="font-family:var(--mono);font-weight:700;color:var(--ok)">All settled</div>
+      <p class="note" style="margin:2px 0 0">Every segment approved, nobody still clocked in.</p>
     @else
-      <div style="font-family:var(--mono);font-weight:700;color:var(--crit)">Blocked</div>
-      <ul style="margin:4px 0 8px;padding-left:16px;font-size:11.5px;color:var(--text-2)">
-        @foreach ($board['day_close']['blockers'] as $b)
-          <li><b>{{ $b['type'] }}</b> — {{ $b['message'] }}</li>
+      <ul style="margin:4px 0 0;padding-left:16px;font-size:11.5px;color:var(--text-2)">
+        @foreach ($board['outstanding'] as $b)
+          <li><b>{{ $b['type'] }}</b> ({{ $b['count'] }}) — {{ $b['message'] }}</li>
         @endforeach
       </ul>
     @endif
-    <form method="POST" action="{{ route('board.day-close') }}" class="inline">
-      @csrf
-      <input type="hidden" name="store_id" value="{{ $storeId }}">
-      <input type="hidden" name="date" value="{{ $date }}">
-      <button class="primary">Close the day</button>
-    </form>
   </div>
 </div>
 
@@ -454,6 +449,47 @@
   </div>
 </div>
 
+{{-- ── file a request ─────────────────────────────────────────────────────
+     On somebody's BEHALF. Employees have no login here, so employee_id is who
+     the request is about and requested_by_user_id is whoever is acting — two
+     columns because they are routinely different people. The API takes the
+     same request from an employee-facing client and lands it in this table.
+
+     Always pending. There is no "file it approved": approval is a decision and
+     a decision leaves a row behind. --}}
+<div class="card pad">
+  <div class="lbl" style="margin-bottom:8px">File a request</div>
+  <form method="POST" action="{{ route('board.requests.store') }}" class="ctl">
+    @csrf
+    <input type="hidden" name="store_id" value="{{ $storeId }}">
+    <label class="f"><span class="lbl">Employee</span>
+      <select name="employee_id" required>
+        @foreach ($roster as $r)
+          <option value="{{ $r['model']->id }}">{{ $r['model']->fullName() }}</option>
+        @endforeach
+      </select>
+    </label>
+    <label class="f"><span class="lbl">Type</span>
+      <select name="request_type">
+        @foreach (\App\Enums\RequestType::cases() as $t)
+          <option value="{{ $t->value }}" @selected($t === \App\Enums\RequestType::TimeOff)>{{ $t->value }}</option>
+        @endforeach
+      </select>
+    </label>
+    <label class="f"><span class="lbl">From</span><input type="date" name="start_date" value="{{ $date }}"></label>
+    <label class="f"><span class="lbl">To</span><input type="date" name="end_date" value="{{ $date }}"></label>
+    <label class="f" style="flex:1 1 220px"><span class="lbl">Description</span>
+      <input type="text" name="description" maxlength="2000" placeholder="optional">
+    </label>
+    <button class="primary">File it</button>
+  </form>
+  <p class="note" style="margin-top:9px">
+    A <code>time_off</code> request needs both dates — without them it is invisible to the
+    conflict check, which is the only reason the row is worth storing. Approved time off is
+    what makes the board warn you before scheduling over it.
+  </p>
+</div>
+
 {{-- ── requests ──────────────────────────────────────────────────────── --}}
 <div class="card pad">
   <div class="tbl-wrap">
@@ -478,14 +514,38 @@
           <td style="white-space:normal;max-width:280px">{{ $q->description }}</td>
           <td>
             @if ($q->status?->value === 'pending')
-              {{-- Undecided: the three ways to settle it. --}}
-              @foreach (['approved', 'denied', 'cancelled'] as $d)
+              {{-- Undecided: the three ways to settle it, plus the two ways to
+                   change it. Correcting is only offered here — once a decision
+                   exists the service refuses the edit, because it would leave
+                   that decision pointing at something never decided. --}}
+              @foreach (['approved', 'denied'] as $d)
                 <form method="POST" action="{{ route('board.requests.decide', $q) }}" class="inline">
                   @csrf<input type="hidden" name="decision" value="{{ $d }}">
                   <button class="mini">{{ $d }}</button>
                 </form>
               @endforeach
-            @else
+              <button class="mini" type="button"
+                      onclick="openRequestEdit(this)"
+                      data-url="{{ route('board.requests.update', $q) }}"
+                      data-request="{{ $q->id }}"
+                      data-who="{{ $q->employee?->fullName() }}"
+                      data-type="{{ $q->request_type?->value }}"
+                      data-start="{{ $q->start_date?->toDateString() }}"
+                      data-end="{{ $q->end_date?->toDateString() }}"
+                      data-description="{{ $q->description }}">correct</button>
+            @endif
+
+            @if ($q->status?->value !== 'cancelled')
+              {{-- Withdrawal appends a CANCELLED decision; it deletes nothing.
+                   Offered on approved rows too — somebody cancelling leave they
+                   no longer need is the ordinary case, and the approval it
+                   reverses stays in the trail above it. --}}
+              <form method="POST" action="{{ route('board.requests.withdraw', $q) }}" class="inline">
+                @csrf<button class="mini danger">withdraw</button>
+              </form>
+            @endif
+
+            @if ($q->status?->value !== 'pending')
               {{-- Already settled. One button, so changing your mind is a
                    deliberate act rather than a mis-click on a row of three.
                    The decision is not overwritten: a new row is appended and
@@ -554,6 +614,67 @@
       'Currently ' + btn.dataset.current + ', after ' + btn.dataset.count + ' decision(s).';
     document.getElementById('decision-value').value = btn.dataset.current;
     document.getElementById('decision-notes').value = '';
+    dlg.showModal();
+  }
+</script>
+
+{{-- ── correct a request ─────────────────────────────────────────────────
+     Only reachable from a PENDING row. The service refuses the edit once a
+     decision exists, and the button is not rendered there either — but the
+     service is the one that decides, because a stale page could still post. --}}
+<dialog id="request-dialog" class="card" style="padding:0;border:1px solid var(--line-2);max-width:520px">
+  <form method="POST" id="request-form" style="margin:0;padding:16px;display:flex;flex-direction:column;gap:12px">
+    @csrf
+    @method('PUT')
+    <div>
+      <div class="lbl">Correct a request</div>
+      <div style="font-family:var(--mono);font-size:13px;font-weight:700;margin-top:3px" id="request-title">—</div>
+    </div>
+
+    <label class="f"><span class="lbl">Type</span>
+      <select name="request_type" id="request-type">
+        @foreach (\App\Enums\RequestType::cases() as $t)
+          <option value="{{ $t->value }}">{{ $t->value }}</option>
+        @endforeach
+      </select>
+    </label>
+
+    <div style="display:flex;gap:10px">
+      <label class="f" style="flex:1"><span class="lbl">From</span>
+        <input type="date" name="start_date" id="request-start" style="width:100%">
+      </label>
+      <label class="f" style="flex:1"><span class="lbl">To</span>
+        <input type="date" name="end_date" id="request-end" style="width:100%">
+      </label>
+    </div>
+
+    <label class="f"><span class="lbl">Description</span>
+      <input type="text" name="description" id="request-description" maxlength="2000" style="width:100%">
+    </label>
+
+    <p class="note" style="margin:0">
+      The employee this is about cannot be changed — that would make it a different
+      request, not a corrected one. Nothing here touches the status: approving is a
+      decision, and this is not one.
+    </p>
+
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button type="button" onclick="document.getElementById('request-dialog').close()">Cancel</button>
+      <button class="primary" type="submit">Save correction</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+  function openRequestEdit(btn) {
+    const dlg = document.getElementById('request-dialog');
+    document.getElementById('request-form').action = btn.dataset.url;
+    document.getElementById('request-title').textContent =
+      btn.dataset.who + ' · request #' + btn.dataset.request;
+    document.getElementById('request-type').value = btn.dataset.type || 'time_off';
+    document.getElementById('request-start').value = btn.dataset.start || '';
+    document.getElementById('request-end').value = btn.dataset.end || '';
+    document.getElementById('request-description').value = btn.dataset.description || '';
     dlg.showModal();
   }
 </script>
@@ -671,7 +792,7 @@
 
 <p class="note">
   Every button on this page calls the same service the JSON API calls — <code>ShiftService</code>,
-  <code>WorkSegmentService</code>, <code>DayCloseService</code>, <code>EmployeeRequestService</code>.
+  <code>WorkSegmentService</code>, <code>EmployeeRequestService</code>.
   A domain refusal (approving an open punch, ending a shift before it starts) comes back as the
   red banner, not a stack trace.
 </p>

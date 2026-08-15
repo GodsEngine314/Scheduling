@@ -6,6 +6,8 @@ use App\Enums\RequestStatus;
 use App\Http\Requests\Api\EmployeeRequestDecideRequest;
 use App\Http\Requests\Api\EmployeeRequestIndexRequest;
 use App\Http\Requests\Api\EmployeeRequestStoreRequest;
+use App\Http\Requests\Api\EmployeeRequestUpdateRequest;
+use App\Http\Requests\Api\EmployeeRequestWithdrawRequest;
 use App\Http\Resources\EmployeeRequestResource;
 use App\Models\EmployeeRequest;
 use App\Services\Scheduling\EmployeeRequestService;
@@ -16,9 +18,19 @@ use Illuminate\Http\JsonResponse;
  * What employees ask the schedule to do, and what a manager decides about it.
  *
  * The status column is a cache of the latest decision row, written in the same
- * transaction by EmployeeRequestService. That is why there is no PUT here: the
- * only way status ever moves is through decide(), which leaves the audit row
- * behind that the cache is derived from.
+ * transaction by EmployeeRequestService. That is why the PUT here cannot touch
+ * it: the only way status ever moves is through decide() or withdraw(), each of
+ * which leaves behind the audit row the cache is derived from.
+ *
+ * So the writes divide cleanly, and the status codes say which is which:
+ *
+ *   store     201   a new request, always pending
+ *   update    200   a correction, and the only true edit — pending only
+ *   decide    201   appends a decision, re-caches status
+ *   withdraw  201   appends a CANCELLED decision. Never a DELETE: a deleted row
+ *                   answers nothing anybody later asks about who requested what.
+ *
+ * There is no destroy(), and that is the design rather than a gap.
  */
 class EmployeeRequestController extends ApiController
 {
@@ -71,6 +83,47 @@ class EmployeeRequestController extends ApiController
             ]));
 
             return EmployeeRequestResource::make($employeeRequest->load(['employee', 'latestDecision']))
+                ->response()
+                ->setStatusCode(201);
+        });
+    }
+
+    /**
+     * Correct a request nobody has ruled on yet.
+     *
+     * 200, not 201: unlike decide(), this leaves no new row behind — it is the
+     * one write on this resource that really is an edit. The service refuses it
+     * once a decision exists, because editing then would leave that decision
+     * pointing at something that was never decided.
+     */
+    public function update(EmployeeRequestUpdateRequest $request, EmployeeRequest $employeeRequest): JsonResponse
+    {
+        return $this->attempt(function () use ($request, $employeeRequest): JsonResponse {
+            $this->requests->update($employeeRequest, $request->validated());
+
+            return EmployeeRequestResource::make($employeeRequest->load(['employee', 'latestDecision']))
+                ->response();
+        });
+    }
+
+    /**
+     * Withdraw a request.
+     *
+     * 201 like decide(), and for the same reason: this IS a decision. It writes
+     * a cancelled row rather than deleting anything, so the trail still answers
+     * who asked for the day off and what became of it.
+     */
+    public function withdraw(EmployeeRequestWithdrawRequest $request, EmployeeRequest $employeeRequest): JsonResponse
+    {
+        return $this->attempt(function () use ($request, $employeeRequest): JsonResponse {
+            $decision = $this->requests->withdraw(
+                $employeeRequest,
+                $this->actingUserId($request),
+                $request->validated('notes'),
+            );
+
+            return EmployeeRequestResource::make($employeeRequest->load(['employee', 'latestDecision']))
+                ->additional(['meta' => ['decision_id' => (int) $decision->id]])
                 ->response()
                 ->setStatusCode(201);
         });

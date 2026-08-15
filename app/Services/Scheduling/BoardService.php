@@ -25,7 +25,6 @@ class BoardService
 {
     public function __construct(
         private readonly BusinessDay $businessDay,
-        private readonly DayCloseService $dayClose,
         private readonly LaborCostEstimator $costs,
     ) {}
 
@@ -38,7 +37,7 @@ class BoardService
      *     present: array<int, array<string, mixed>>,
      *     scheduled_absent: array<int, array<string, mixed>>,
      *     present_unscheduled: array<int, array<string, mixed>>,
-     *     day_close: array<string, mixed>,
+     *     outstanding: array<int, array<string, mixed>>,
      *     cost: array<string, mixed>
      * }
      */
@@ -62,9 +61,72 @@ class BoardService
             'present' => $this->present($storeId, $segments),
             'scheduled_absent' => $this->scheduledAbsent($shifts, $segments),
             'present_unscheduled' => $this->presentUnscheduled($shifts, $segments),
-            'day_close' => $this->dayClose->check($storeId, $businessDate),
+            'outstanding' => $this->outstanding($storeId, $segments),
             'cost' => $this->costs->estimateFor($shifts, $storeId, $businessDate),
         ];
+    }
+
+    /**
+     * Hours nobody has signed off, and people still clocked in.
+     *
+     * There is no close on this board any more — no day close, no week close —
+     * so nothing here gates anything. It is reported because the day board is
+     * about the ACTUAL side and "Dana is still clocked in" is the thing a
+     * manager came to this screen to find out.
+     *
+     * TWO CATEGORIES, KEPT APART, for the same reason the close used to keep
+     * them apart: an open punch has no hours to approve at all, so folding it
+     * into "unapproved" would let somebody clear the list without ever noticing
+     * that a person's time is missing.
+     *
+     * Computed over the segments already in memory — no extra query.
+     *
+     * @param  Collection<int, WorkSegment>  $segments
+     * @return array<int, array<string, mixed>>
+     */
+    private function outstanding(int $storeId, Collection $segments): array
+    {
+        $rows = [];
+
+        $unapproved = $segments->filter(
+            fn (WorkSegment $s): bool => $s->time_out !== null && ! $s->manager_approval
+        );
+
+        $open = $segments->filter(fn (WorkSegment $s): bool => $s->time_out === null);
+
+        if ($unapproved->isNotEmpty()) {
+            $rows[] = [
+                'type' => 'unapproved',
+                'count' => $unapproved->count(),
+                // Named, not counted: "3 unapproved segments" is not something a
+                // manager can act on and "Dana Okafor" is.
+                'employees' => $this->names($unapproved),
+                'message' => 'Finished hours nobody has approved: '.$this->names($unapproved).'.',
+            ];
+        }
+
+        if ($open->isNotEmpty()) {
+            $rows[] = [
+                'type' => 'open_punch',
+                'count' => $open->count(),
+                'employees' => $this->names($open),
+                'message' => 'Still clocked in, no hours to approve yet: '.$this->names($open).'.',
+            ];
+        }
+
+        return $rows;
+    }
+
+    /** @param  Collection<int, WorkSegment>  $segments */
+    private function names(Collection $segments): string
+    {
+        $names = $segments
+            ->map(fn (WorkSegment $s): ?string => $s->employee?->fullName())
+            ->filter()
+            ->unique()
+            ->values();
+
+        return $names->isEmpty() ? 'unnamed employees' : $names->join(', ');
     }
 
     /**

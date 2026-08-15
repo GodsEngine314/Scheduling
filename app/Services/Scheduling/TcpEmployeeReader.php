@@ -8,6 +8,7 @@ use App\Enums\IntegrationSyncState;
 use App\Enums\IntegrationSystem;
 use App\Models\Employee;
 use App\Models\IntegrationIdentity;
+use App\Models\Store;
 use App\Support\Integrations\Tcp\TcpClient;
 use Illuminate\Support\Facades\DB;
 
@@ -63,19 +64,24 @@ class TcpEmployeeReader
             return $this->report(0, 0, 0, [], [['reason' => 'tcp_not_configured']]);
         }
 
-        $locationId = $this->tcpLocationIdForStore($storeId);
+        $storeNumber = $this->storeNumberFor($storeId);
 
-        if ($locationId === null) {
-            // Without a location id the only filter available is "none", and an
-            // unfiltered GET /employees returns the entire company — every one
-            // of whom would then look like they work at this store.
+        if ($storeNumber === null) {
+            // Without it the only filter available is "none", and an unfiltered
+            // GET /employees returns the entire company — every one of whom
+            // would then look like they work at this store. Measured: 430.
             return $this->report(0, 0, 0, [], [[
-                'reason' => 'store_has_no_tcp_location',
+                'reason' => 'store_has_no_store_number',
                 'store_id' => $storeId,
             ]]);
         }
 
-        $records = $this->tcp->employees(new EmployeeFilter(locationIds: [$locationId]));
+        // THE STORE NUMBER, NOT THE NUMERIC LOCATION ID, and this was verified
+        // the hard way: `locationIds=9830400` was silently ignored and returned
+        // the whole company. `locations=03795-00001` returns that store's twenty.
+        // An employee record's own `location` field carries the same string, so
+        // the filter and the record agree.
+        $records = $this->tcp->employees(new EmployeeFilter(locations: [$storeNumber]));
 
         $mapped = 0;
         $alreadyMapped = 0;
@@ -204,14 +210,18 @@ class TcpEmployeeReader
         };
     }
 
-    /** This store's TCP location id, from the scheduling-owned identity map. */
-    private function tcpLocationIdForStore(int $storeId): ?string
+    /**
+     * The store number TCP files this store's employees under.
+     *
+     * Read from the stores PROJECTION rather than integration_identities,
+     * because this is not an id we obtained from TCP — it is the number on the
+     * building, and auth already sends it. The numeric TCP location id in
+     * integration_identities is a different value and does NOT work as a filter
+     * here; it is what an inbound punch's location resolves through.
+     */
+    private function storeNumberFor(int $storeId): ?string
     {
-        return $this->string(
-            IntegrationIdentity::query()
-                ->forEntity(IntegrationEntityType::Store, $storeId, IntegrationSystem::Tcp)
-                ->value('external_id')
-        );
+        return $this->string(Store::query()->whereKey($storeId)->value('store_number'));
     }
 
     /**

@@ -40,6 +40,9 @@ beforeEach(function () {
     $this->bd = app(BusinessDay::class);
     $this->today = $this->bd->toLocal(DemoSeeder::STORE_ID, now())->toDateString();
     $this->tomorrow = now()->parse($this->today)->addDay()->toDateString();
+
+    // Every route requires a token the auth service issued.
+    signIn();
 });
 
 /** A shift nobody has punched against — the only kind that can be moved. */
@@ -210,39 +213,40 @@ it('stamps a created shift with the acting user', function () {
     expect((int) Shift::latest('id')->firstOrFail()->created_by_user_id)->toBe((int) $manager->id);
 });
 
-it('leaves the actor null when nobody is acting', function () {
-    $this->post('/board/shifts', [
-        'store_id' => DemoSeeder::STORE_ID,
-        'date' => $this->today,
-        'employee_id' => Employee::value('id'),
-        'start' => '09:00',
-        'end' => '12:00',
-    ])->assertRedirect();
+it('cannot be reached at all without a signed-in identity', function () {
+    // There is no longer an "unattributed" write to test for: every route needs
+    // a token, so nobody-is-acting is not a state a request can reach.
+    $before = Shift::count();
 
-    expect(Shift::latest('id')->firstOrFail()->created_by_user_id)->toBeNull();
+    $this->withHeaders(['Authorization' => ''])
+        ->post('/board/shifts', [
+            'store_id' => DemoSeeder::STORE_ID,
+            'date' => $this->today,
+            'employee_id' => Employee::value('id'),
+            'start' => '09:00',
+            'end' => '12:00',
+        ])
+        ->assertRedirect(route('login'));
+
+    expect(Shift::count())->toBe($before);
 });
 
-it('switches the acting user and stamps the next change with them', function () {
-    $first = User::orderBy('id')->firstOrFail();
-    $second = User::query()->where('id', '!=', $first->id)->first()
+it('lets the signed-in identity win over the acting-as picker', function () {
+    $signedIn = User::orderBy('id')->firstOrFail();
+    $other = User::query()->where('id', '!=', $signedIn->id)->first()
         ?? User::create(['name' => 'Second Manager', 'email' => 'second@example.test', 'password' => 'x']);
 
-    $this->post('/acting-user', ['user_id' => $first->id])->assertRedirect();
-    $this->post('/board/shifts', [
-        'store_id' => DemoSeeder::STORE_ID,
-        'date' => $this->today,
-        'employee_id' => Employee::value('id'),
-        'start' => '09:00',
-        'end' => '12:00',
-    ])->assertRedirect();
-    $created = Shift::latest('id')->firstOrFail();
+    // signIn() in beforeEach is acting as $signedIn. Naming somebody else in the
+    // picker must NOT change who the write is attributed to — ActingUser reads
+    // $request->user() first, and a real identity is not overridable from a form
+    // field. Anything else would make the picker a way to write under another
+    // person's name.
+    $this->post('/acting-user', ['user_id' => $other->id])->assertRedirect();
 
-    $this->post('/acting-user', ['user_id' => $second->id])->assertRedirect();
     $segment = WorkSegment::whereNotNull('time_out')->where('manager_approval', false)->firstOrFail();
     $this->post("/board/segments/{$segment->id}/approve")->assertRedirect();
 
-    expect((int) $created->created_by_user_id)->toBe((int) $first->id)
-        ->and((int) $segment->fresh()->approved_by_user_id)->toBe((int) $second->id);
+    expect((int) $segment->fresh()->approved_by_user_id)->toBe((int) $signedIn->id);
 });
 
 it('blanks the actor rather than blocking when the auth user is deleted', function () {

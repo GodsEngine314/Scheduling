@@ -32,6 +32,9 @@ beforeEach(function () {
     $this->bd = app(BusinessDay::class);
     $this->svc = app(ShiftService::class);
     $this->today = $this->bd->toLocal(DemoSeeder::STORE_ID, now())->toDateString();
+
+    // Every route requires a token the auth service issued.
+    signIn();
 });
 
 /** An unsplit, assigned shift to work from. */

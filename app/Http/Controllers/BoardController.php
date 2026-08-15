@@ -4,6 +4,8 @@ namespace App\Http\Controllers;
 
 use App\Enums\PublishState;
 use App\Enums\RequestDecision;
+use App\Enums\RequestStatus;
+use App\Enums\RequestType;
 use App\Exceptions\SchedulingException;
 use App\Models\Employee;
 use App\Models\EmployeeRequest;
@@ -13,11 +15,11 @@ use App\Models\Store;
 use App\Models\User;
 use App\Models\WorkSegment;
 use App\Services\Scheduling\BoardService;
-use App\Services\Scheduling\DayCloseService;
 use App\Services\Scheduling\EmployeeRequestService;
 use App\Services\Scheduling\LaborCostEstimator;
 use App\Services\Scheduling\SchedulePublisher;
 use App\Services\Scheduling\ShiftService;
+use App\Services\Scheduling\StoreSettingService;
 use App\Services\Scheduling\TcpEmployeeReader;
 use App\Services\Scheduling\WorkSegmentService;
 use App\Services\Scheduling\WorkSegmentSyncService;
@@ -30,6 +32,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Validation\Rule;
 use Illuminate\View\View;
 use Throwable;
 
@@ -47,18 +50,21 @@ class BoardController extends Controller
     /** The store the roster was last read from TCP for. See pullEmployeesOnStoreChange(). */
     private const EMPLOYEE_PULL_KEY = 'tcp_employee_pull_store';
 
+    /** The store+range the punches were last read from TCP for. See pullSegmentsOnRangeChange(). */
+    private const SEGMENT_PULL_KEY = 'tcp_segment_pull_range';
+
     public function __construct(
         private readonly BoardService $board,
         private readonly ShiftService $shifts,
         private readonly WorkSegmentService $segments,
         private readonly EmployeeRequestService $requests,
-        private readonly DayCloseService $dayClose,
         private readonly LaborCostEstimator $costs,
         private readonly SchedulePublisher $publisher,
         private readonly WorkSegmentSyncService $segmentSync,
         private readonly TcpEmployeeReader $tcpEmployees,
         private readonly BusinessDay $businessDay,
         private readonly ActingUser $actingUser,
+        private readonly StoreSettingService $settings,
     ) {}
 
     public function index(Request $request): View
@@ -70,6 +76,11 @@ class BoardController extends Controller
 
         $date = (string) ($request->query('date')
             ?: $this->businessDay->toLocal($storeId, now())->toDateString());
+
+        // Before the queries below, for the same reason the week view does it:
+        // the day board is where punches are approved and corrected, and it
+        // cannot show hours it never asked for. One day, one request, once.
+        $this->pullSegmentsOnRangeChange($request, $storeId, $date, $date);
 
         $board = $this->board->forDate($storeId, $date);
 
@@ -159,8 +170,13 @@ class BoardController extends Controller
             return;
         }
 
-        if (in_array('store_has_no_tcp_location', $reasons, true)) {
-            $this->flashNow('err', 'This store has no TCP location id, so its roster could not be read.');
+        // The STORE NUMBER, not the numeric TCP location id: that is what
+        // TcpEmployeeReader filters GET /employees by, and what it reports
+        // missing. This checked for the wrong reason string and so never fired,
+        // leaving a store with no number to report a cheerful "0 at this
+        // location" instead of saying why.
+        if (in_array('store_has_no_store_number', $reasons, true)) {
+            $this->flashNow('err', 'This store has no store number, so its roster could not be read from TCP.');
 
             return;
         }
@@ -184,6 +200,89 @@ class BoardController extends Controller
         $this->flashNow('err', $message.' '.count($unmatched).' not in our roster'
             .' ('.$names.(count($unmatched) > 5 ? ', …' : '').')'
             .' — they arrive from hiring, and are not created from TCP.');
+    }
+
+    /**
+     * Read the week's punches from TCP the first time the actual tab lands on it.
+     *
+     * WHY THIS EXISTS. The tab rendered whatever had already been pulled, and
+     * nothing pulled unless somebody found the "Pull the week's actual hours"
+     * button and pressed it. So a store nobody had pressed it for showed an
+     * empty grid that was indistinguishable from "nobody worked" — the punches
+     * were sitting in TCP the whole time. Picking a week and pressing Go now
+     * fetches it, which is what pressing Go looks like it should do.
+     *
+     * ON CHANGE, NOT ON RENDER, and keyed on store AND week — the same bargain
+     * pullEmployeesOnStoreChange() strikes, for the same reason. Every approve,
+     * correct and delete on this tab redirects back here, and a vendor round
+     * trip on each would put TCP's latency in front of every click. Stepping
+     * through a month costs four calls; clicking about within one week costs
+     * none.
+     *
+     * NOTHING HERE CAN BREAK THE PAGE. The pull is a convenience; the hours
+     * already in the table are not. Any failure degrades to a message and the
+     * grid renders exactly as it would have.
+     *
+     * The button stays. This runs once per store-range, and re-pulling on demand
+     * is free — the upsert is keyed on tcp_segment_id — so the way to get a
+     * punch somebody made in the last minute is still to ask for it.
+     *
+     * Both boards call this. The key carries the whole range rather than just
+     * its start, so a day board on Monday and a week board starting Monday are
+     * two different pulls — otherwise opening the day first would convince the
+     * week it had already fetched its other six days.
+     */
+    private function pullSegmentsOnRangeChange(Request $request, int $storeId, string $from, string $to): void
+    {
+        $key = $storeId.':'.$from.':'.$to;
+
+        if (! $request->hasSession() || $request->session()->get(self::SEGMENT_PULL_KEY) === $key) {
+            return;
+        }
+
+        // Recorded BEFORE the call: a week whose pull fails must not retry on
+        // every subsequent render of the same grid.
+        $request->session()->put(self::SEGMENT_PULL_KEY, $key);
+
+        try {
+            $result = $this->segmentSync->syncRange($from, $to, $storeId);
+        } catch (Throwable $e) {
+            $this->flashNow('err', 'Could not read this week\'s hours from TCP — '
+                .class_basename($e).': '.$e->getMessage());
+
+            return;
+        }
+
+        // Rows TCP sent that we refused. Not silence: they are hours that exist
+        // at the vendor and are not on this screen.
+        $skipped = $result['skipped'] ?? [];
+
+        if ($skipped !== []) {
+            $why = collect($skipped)
+                ->map(fn ($row) => is_array($row) ? ($row['reason'] ?? 'unknown') : (string) $row)
+                ->countBy()
+                ->map(fn (int $n, string $reason) => "{$reason} ×{$n}")
+                ->join(', ');
+
+            $this->flashNow('err', 'Pulled '.$result['fetched'].' from TCP. Skipped: '.$why.'.');
+
+            return;
+        }
+
+        // Silent when there was nothing to say. Somebody who opened this tab to
+        // read a grid does not need a banner telling them the grid loaded.
+        if ((int) ($result['created'] ?? 0) === 0 && (int) ($result['updated'] ?? 0) === 0) {
+            return;
+        }
+
+        $parts = [];
+        foreach (['created', 'updated'] as $word) {
+            if ((int) ($result[$word] ?? 0) > 0) {
+                $parts[] = $result[$word].' '.$word;
+            }
+        }
+
+        $this->flashNow('ok', 'TCP: '.implode(', ', $parts).' for this week.');
     }
 
     /**
@@ -223,11 +322,24 @@ class BoardController extends Controller
     }
 
     /**
-     * The week grid: seven days across, one row per employee.
+     * The week grid: seven days across, one row per employee, in one of two
+     * views.
      *
-     * The day board is for the ACTUAL side — punches, approvals, the close,
-     * all of which are inherently about one date. This is for building the
-     * plan, which people do a week at a time and by dragging.
+     *   PLANNED — the shifts we intend, dragged into place and published to
+     *   Humanity. This is the schedule being built.
+     *
+     *   ACTUAL — the punches TCP recorded against those days. Approve, correct
+     *   or delete them here; an open punch shows its clock-in with no clock-out,
+     *   because somebody is still in the store and there are no hours yet.
+     *
+     * ONE PAGE, TWO READINGS OF THE SAME WEEK. They are separate views rather
+     * than two chips in one cell because they answer different questions and are
+     * acted on by different hands — and because a cell holding both is unreadable
+     * the moment anybody works a split shift.
+     *
+     * Both sides are loaded on either view. The counts on the inactive tab are
+     * the reason: a manager who cannot see "6 to approve" without switching will
+     * not switch, and the hours sit unapproved.
      */
     public function week(Request $request): View
     {
@@ -236,6 +348,8 @@ class BoardController extends Controller
 
         $anchor = (string) ($request->query('week')
             ?: $this->businessDay->toLocal($storeId, now())->toDateString());
+
+        $view = $request->query('view') === 'actual' ? 'actual' : 'planned';
 
         // Monday-first. startOfWeek() honours the app locale, which is not a
         // decision this screen should inherit silently.
@@ -251,22 +365,99 @@ class BoardController extends Controller
             ->forStoreBetween($storeId, $days->first(), $days->last())
             ->get();
 
+        // BEFORE the query, or the first render of a week shows the punches it
+        // had rather than the ones it just fetched.
+        if ($view === 'actual') {
+            $this->pullSegmentsOnRangeChange($request, $storeId, $days->first(), $days->last());
+        }
+
+        $segments = WorkSegment::query()
+            ->with(['employee', 'position'])
+            ->forStoreBetween($storeId, $days->first(), $days->last())
+            ->get();
+
+        $roster = $this->roster($storeId, $days->first());
+
         return view('board.week', [
             'stores' => $stores,
             'storeId' => $storeId,
             'weekStart' => $start->toDateString(),
             'days' => $days->all(),
+            'view' => $view,
             'shifts' => $shifts,
+            'segments' => $segments,
             'byCell' => $shifts->groupBy([
                 fn (Shift $s): string => (string) ($s->employee_id ?? 'open'),
                 fn (Shift $s): string => $this->dateOf($s->business_date),
             ]),
-            'roster' => $this->roster($storeId, $days->first()),
+            // Punches have no open row: a punch is somebody clocking in, so
+            // there is always an employee behind it.
+            'segsByCell' => $segments->groupBy([
+                fn (WorkSegment $g): string => (string) $g->employee_id,
+                fn (WorkSegment $g): string => $this->dateOf($g->business_date),
+            ]),
+            // The forms offer the roster. The GRID has to show more than that on
+            // the actual side — see rowsForActual().
+            'roster' => $roster,
+            'rows' => $view === 'actual' ? $this->rowsForActual($roster, $segments, $days->first()) : $roster,
             'positions' => Position::query()->orderBy('id')->get(),
             'costs' => $this->costs->estimateFor($shifts, $storeId, null),
+            'actuals' => $this->costs->actualFor($segments, $storeId),
             'publishable' => $this->publisher->pendingInRange($storeId, $days->first(), $days->last())->count(),
             'timezone' => $this->businessDay->timezoneFor($storeId),
         ]);
+    }
+
+    /**
+     * The grid's rows on the ACTUAL side: the roster, plus anybody who punched
+     * here this week and is not on it.
+     *
+     * THE ROSTER IS THE WRONG LIST FOR WORKED HOURS, and quietly so. It answers
+     * "who can be scheduled here now" — schedulable status, assigned to this
+     * store — while a punch is a record of something that already happened. The
+     * two disagree in exactly the cases that matter most:
+     *
+     *   somebody terminated on Wednesday still worked Monday and Tuesday, and
+     *   hiring's termination drops them off the roster retroactively;
+     *
+     *   somebody covering from another store punches in here without ever
+     *   appearing on this store's roster.
+     *
+     * Rendering only the roster would drop those chips off the grid while their
+     * hours kept counting in the header total and in the cost — a week that does
+     * not add up, with the missing rows invisible rather than flagged. They are
+     * appended instead, marked off_roster so the row can say why it is there.
+     *
+     * @param  array<int, array<string, mixed>>  $roster
+     * @param  \Illuminate\Support\Collection<int, WorkSegment>  $segments
+     * @return array<int, array<string, mixed>>
+     */
+    private function rowsForActual(array $roster, $segments, string $date): array
+    {
+        $rosterIds = array_map(static fn (array $row): int => (int) $row['model']->id, $roster);
+
+        $strays = $segments
+            ->map(static fn (WorkSegment $segment): ?Employee => $segment->employee)
+            ->filter()
+            ->unique('id')
+            ->reject(fn (Employee $employee): bool => in_array((int) $employee->id, $rosterIds, true))
+            ->map(function (Employee $employee) use ($date): array {
+                $rate = $this->costs->rateOn((int) $employee->id, $date);
+
+                return [
+                    'model' => $employee,
+                    'age' => null,
+                    'rate' => $rate === null ? null : (float) $rate->base_pay + (float) $rate->performance_pay,
+                    // Availability is a scheduling question. It has nothing to
+                    // say about hours already worked.
+                    'windows' => collect(),
+                    'off_roster' => true,
+                ];
+            })
+            ->values()
+            ->all();
+
+        return [...$roster, ...$strays];
     }
 
     /**
@@ -352,10 +543,17 @@ class BoardController extends Controller
         $data = $request->validate([
             'store_id' => ['required', 'integer', 'exists:stores,id'],
             'date' => ['required', 'date_format:Y-m-d'],
+            // The week view sends a span. Absent, it is the single day the day
+            // board asks for — one request either way, because the filter takes
+            // a range and a week's employee list is the same list seven times.
+            'to' => ['nullable', 'date_format:Y-m-d', 'after_or_equal:date'],
         ]);
 
+        $to = $data['to'] ?? $data['date'];
+        $span = $to === $data['date'] ? $data['date'] : $data['date'].' to '.$to;
+
         try {
-            $result = $this->segmentSync->syncDate($data['date'], (int) $data['store_id']);
+            $result = $this->segmentSync->syncRange($data['date'], $to, (int) $data['store_id']);
         } catch (Throwable $e) {
             return back()->with('err', 'TCP pull failed — '.class_basename($e).': '.$e->getMessage());
         }
@@ -368,8 +566,8 @@ class BoardController extends Controller
         }
 
         $message = ((int) ($result['fetched'] ?? 0) === 0)
-            ? 'TCP returned no punches for '.$data['date'].'.'
-            : 'Pulled '.$result['fetched'].' from TCP for '.$data['date']
+            ? 'TCP returned no punches for '.$span.'.'
+            : 'Pulled '.$result['fetched'].' from TCP for '.$span
                 .($parts === [] ? '' : ': '.implode(', ', $parts)).'.';
 
         // 'held' is not a failure but it is not silence either: TCP disagreed
@@ -521,6 +719,52 @@ class BoardController extends Controller
             .($wasPublished
                 ? ' It is already in Humanity, so the next publish run will send the change.'
                 : ' Nothing has been sent to Humanity — it is still a draft.'));
+    }
+
+    /**
+     * Create an ACTUAL shift by hand: the document's "forgot to clock in"
+     * workflow, and the one piece of segment CRUD the console did not have.
+     *
+     * origin = manual_create and tcp_segment_id stays NULL until the POST to TCP
+     * succeeds, so a failed push leaves visible hours behind rather than losing
+     * them. Leave the clock-out empty to record somebody who is still in the
+     * store — that is an open punch, not an incomplete form.
+     */
+    public function storeSegment(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'store_id' => ['required', 'integer', 'exists:stores,id'],
+            'employee_id' => ['required', 'integer', 'exists:employees,id'],
+            'position_id' => ['nullable', 'integer', 'exists:positions,id'],
+            'date' => ['required', 'date_format:Y-m-d'],
+            'time_in' => ['required', 'date_format:H:i'],
+            // A clock-out BEFORE the clock-in is a punch that ran past midnight
+            // and rolls forward. One EQUAL to it is a typo, not a 24-hour shift.
+            'time_out' => ['nullable', 'date_format:H:i', 'different:time_in'],
+            'break_minutes' => ['nullable', 'integer', 'min:0', 'max:1440'],
+            'notes' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $outDate = ($data['time_out'] ?? null) !== null && $data['time_out'] < $data['time_in']
+            ? now()->parse($data['date'])->addDay()->toDateString()
+            : $data['date'];
+
+        $open = ($data['time_out'] ?? null) === null;
+
+        return $this->attempt($request, fn () => $this->segments->create([
+            'store_id' => (int) $data['store_id'],
+            'employee_id' => (int) $data['employee_id'],
+            'position_id' => $data['position_id'] ?? null,
+            // _local, not the bare column: the form collects store wall clock,
+            // and the service converts. Passing time_in here would read 09:30 as
+            // UTC and file the punch at the store's offset.
+            'time_in_local' => "{$data['date']} {$data['time_in']}:00",
+            'time_out_local' => $open ? null : "{$outDate} {$data['time_out']}:00",
+            'break_minutes' => (int) ($data['break_minutes'] ?? 0),
+            'notes' => $data['notes'] ?? null,
+        ]), $open
+            ? 'Open punch recorded — clocked in, still in the store. It has no hours to approve yet.'
+            : 'Actual hours recorded and queued for TCP. They are unapproved until somebody signs them off.');
     }
 
     /**
@@ -700,21 +944,78 @@ class BoardController extends Controller
         return $this->attempt($request, fn () => $this->segments->delete($segment), 'Punch deleted.');
     }
 
-    public function closeDay(Request $request): RedirectResponse
+    /**
+     * File a request from the console, on somebody's behalf.
+     *
+     * Employees have no login here, so a manager typing it is the normal case —
+     * which is exactly why employee_id (the SUBJECT) and requested_by_user_id
+     * (who TYPED it) are two columns. The API accepts the same request from an
+     * employee-facing client; both land in the same table and are told apart by
+     * that second column, not by a separate route.
+     *
+     * Always born pending. There is no "approve as you file it" here: approval
+     * is a decision, and a decision leaves a row behind.
+     */
+    public function storeRequest(Request $request): RedirectResponse
     {
-        try {
-            $result = $this->dayClose->close(
-                (int) $request->input('store_id'),
-                (string) $request->input('date'),
-                $this->actingUser->id(),
-            );
+        $data = $request->validate([
+            'employee_id' => ['required', 'integer', 'exists:employees,id'],
+            'store_id' => ['required', 'integer', 'exists:stores,id'],
+            'request_type' => ['required', Rule::enum(RequestType::class)],
+            'description' => ['nullable', 'string', 'max:2000'],
+            'start_date' => ['nullable', 'date_format:Y-m-d'],
+            'end_date' => ['nullable', 'date_format:Y-m-d', 'after_or_equal:start_date'],
+            'shift_id' => ['nullable', 'integer', 'exists:shifts,id'],
+        ]);
 
-            return back()->with('ok', 'Day closed at '.$result['closed_at'].'.');
-        } catch (SchedulingException $e) {
-            return back()->with('err', $e->getMessage());
-        } catch (Throwable $e) {
-            return back()->with('err', $e->getMessage());
-        }
+        return $this->attempt($request, fn () => $this->requests->create(array_merge($data, [
+            // From the session, never the form: whoever is acting is who typed
+            // it, and a form that could name the filer could name anyone.
+            'requested_by_user_id' => $this->actingUser->id(),
+        ])), 'Request filed, and pending. It needs a decision before it affects the schedule.');
+    }
+
+    /**
+     * Fix a request nobody has ruled on yet.
+     *
+     * The service refuses this once a decision exists — see
+     * EmployeeRequestService::update(). Wrong dates on an approved request are
+     * corrected by withdrawing it and filing the right one, which is the
+     * version that leaves a trail.
+     */
+    public function updateRequest(Request $request, EmployeeRequest $employeeRequest): RedirectResponse
+    {
+        $data = $request->validate([
+            'request_type' => ['sometimes', Rule::enum(RequestType::class)],
+            'description' => ['sometimes', 'nullable', 'string', 'max:2000'],
+            'start_date' => ['sometimes', 'nullable', 'date_format:Y-m-d'],
+            'end_date' => ['sometimes', 'nullable', 'date_format:Y-m-d', 'after_or_equal:start_date'],
+            'shift_id' => ['sometimes', 'nullable', 'integer', 'exists:shifts,id'],
+        ]);
+
+        return $this->attempt(
+            $request,
+            fn () => $this->requests->update($employeeRequest, $data),
+            "Request #{$employeeRequest->id} corrected. It is still pending.",
+        );
+    }
+
+    /**
+     * Withdraw a request. Appends a cancelled decision; deletes nothing.
+     */
+    public function withdrawRequest(Request $request, EmployeeRequest $employeeRequest): RedirectResponse
+    {
+        $notes = $request->filled('notes') ? (string) $request->input('notes') : null;
+        $wasApproved = $employeeRequest->status === RequestStatus::Approved;
+
+        return $this->attempt(
+            $request,
+            fn () => $this->requests->withdraw($employeeRequest, $this->actingUser->id(), $notes),
+            "Request #{$employeeRequest->id} withdrawn."
+                .($wasApproved
+                    ? ' It was approved, so the time off it protected is now free to schedule over.'
+                    : ' The decision trail keeps it.'),
+        );
     }
 
     public function decideRequest(Request $request, EmployeeRequest $employeeRequest): RedirectResponse
@@ -739,6 +1040,64 @@ class BoardController extends Controller
                 : "Request #{$employeeRequest->id} changed to {$decision->value}. "
                     .'The previous decision is kept in the trail.',
         );
+    }
+
+    /**
+     * Per-store scheduling settings.
+     *
+     * These were seeder-only until now, which meant a store arriving from auth
+     * could not be configured without a deploy — and timezone is the column
+     * that decides which day every shift is filed under.
+     */
+    public function settings(Request $request): View
+    {
+        $stores = Store::query()->orderBy('id')->get();
+        $storeId = (int) ($request->query('store') ?: $stores->first()?->id ?: DemoSeeder::STORE_ID);
+
+        return view('board.settings', [
+            'stores' => $stores,
+            'storeId' => $storeId,
+            'setting' => $this->settings->forStore($storeId),
+            // Grouped so the picker is navigable; a flat list of 400-odd zones
+            // is not something anybody scrolls.
+            'timezones' => collect(timezone_identifiers_list())
+                ->filter(fn (string $zone): bool => str_starts_with($zone, 'America/')
+                    || str_starts_with($zone, 'Pacific/')
+                    || str_starts_with($zone, 'US/'))
+                ->values()
+                ->all(),
+        ]);
+    }
+
+    /**
+     * Save them.
+     *
+     * A timezone change is loud on purpose — see StoreSettingService, and the
+     * flash below. It cannot reach the queue workers' own static caches.
+     */
+    public function updateSettings(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'store_id' => ['required', 'integer', 'exists:stores,id'],
+            'timezone' => ['required', 'string', 'timezone'],
+            'publish_lead_days' => ['required', 'integer', 'min:0', 'max:365'],
+            'auto_publish' => ['nullable', 'boolean'],
+        ]);
+
+        $storeId = (int) $data['store_id'];
+        $before = $this->settings->forStore($storeId)->timezone;
+
+        $changed = $before !== $data['timezone'];
+
+        return $this->attempt($request, fn () => $this->settings->update($storeId, [
+            'timezone' => $data['timezone'],
+            'publish_lead_days' => (int) $data['publish_lead_days'],
+            'auto_publish' => (bool) ($data['auto_publish'] ?? false),
+        ]), $changed
+            ? "Settings saved. Timezone moved from {$before} to {$data['timezone']} — shifts already "
+                .'filed keep the business date they were saved under, and only new ones use the new zone. '
+                .'Restart any running queue workers: they cache the old zone for the life of the process.'
+            : 'Settings saved.');
     }
 
     public function reseed(): RedirectResponse
@@ -772,7 +1131,22 @@ class BoardController extends Controller
     {
         return Employee::query()
             ->with('availabilityWindows')
-            ->where('primary_store_id', $storeId)
+            // The same definition of "belongs to this store" the API uses — see
+            // EmployeeController::index(). It differed here in both halves, and
+            // both differences put the wrong people on the board:
+            //
+            //   SCHEDULABLE. Hiring publishes no employee.deleted event, so a
+            //   termination arrives as a status change and the row stays. Without
+            //   this, everyone who ever left the store is still on the board.
+            //
+            //   ASSIGNMENTS. People cover stores that are not their primary one,
+            //   and a roster that only reads primary_store_id cannot staff a
+            //   Saturday. The nested closure keeps the OR from escaping and
+            //   swallowing the status filter.
+            ->schedulable()
+            ->where(fn ($query) => $query
+                ->where('primary_store_id', $storeId)
+                ->orWhereHas('storeAssignments', fn ($assignment) => $assignment->where('store_id', $storeId)))
             ->orderBy('first_name')
             ->get()
             ->map(function (Employee $employee) use ($date): array {

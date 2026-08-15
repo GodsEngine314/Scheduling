@@ -27,7 +27,7 @@ class WorkSegmentController extends ApiController
         private readonly BusinessDay $businessDay,
     ) {}
 
-    /** One store, one business date, with the day-close views as filters. */
+    /** One store, one business date, with the outstanding-hours views as filters. */
     public function index(WorkSegmentIndexRequest $request): JsonResponse
     {
         $storeId = (int) $request->validated('store');
@@ -36,7 +36,7 @@ class WorkSegmentController extends ApiController
 
         // unapproved and open_punches are disjoint by definition — unapproved
         // requires a time_out and an open punch has none — so asking for both
-        // correctly returns nothing. The day-close screen asks for them
+        // correctly returns nothing. The board asks for them
         // separately, which is the whole point of keeping them apart.
         $segments = WorkSegment::query()
             ->with(['employee', 'position'])
@@ -119,5 +119,4 @@ class WorkSegmentController extends ApiController
             return response()->json(null, 204);
         });
     }
-
 }

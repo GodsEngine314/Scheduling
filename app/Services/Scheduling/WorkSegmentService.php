@@ -100,9 +100,13 @@ class WorkSegmentService
     }
 
     /**
-     * An open punch has no hours to approve. Refusing it here is what keeps
-     * DayCloseService's two blocker categories from collapsing into one — an
-     * "approved" open punch would let a day close over somebody's missing time.
+     * An open punch has no hours to approve.
+     *
+     * Refusing it here is what keeps the board's two outstanding categories from
+     * collapsing into one: an "approved" open punch would clear itself off the
+     * unapproved list while somebody's time was still missing. That mattered
+     * when a day close was gated on it and it still matters now that nothing is
+     * — the list is what a manager reads to know the day is settled.
      */
     public function approve(WorkSegment $segment, ?int $userId = null): WorkSegment
     {

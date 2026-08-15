@@ -38,8 +38,26 @@ return [
             'database' => env('DB_DATABASE', database_path('database.sqlite')),
             'prefix' => '',
             'foreign_key_constraints' => env('DB_FOREIGN_KEYS', true),
-            'busy_timeout' => null,
-            'journal_mode' => null,
+            /**
+             * WAL, because this app is never one process.
+             *
+             * `composer run dev` puts artisan serve and a queue listener on the
+             * same file, nats:consume is a third, and a seeder or tinker makes a
+             * fourth. Under the default `delete` journal a single writer locks
+             * out every reader for the length of its transaction, so a seed that
+             * writes a few hundred rows fails with "database is locked" while
+             * the queue worker is merely polling. WAL lets readers carry on
+             * during a write, which is the difference between those processes
+             * coexisting and not.
+             *
+             * The pragma is persistent — it is stored in the database file, not
+             * the connection — so it survives being set once.
+             *
+             * busy_timeout is the backstop for the one thing WAL does not fix:
+             * two writers at once. Ten seconds of retrying beats failing.
+             */
+            'busy_timeout' => env('DB_BUSY_TIMEOUT', 10000),
+            'journal_mode' => env('DB_JOURNAL_MODE', 'WAL'),
             'synchronous' => null,
             'transaction_mode' => 'DEFERRED',
         ],

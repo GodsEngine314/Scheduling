@@ -89,6 +89,20 @@ class WorkSegment extends Model
     }
 
     /**
+     * The week view's ACTUAL side, mirroring Shift::forStoreBetween().
+     *
+     * Ordered by time_in within the day so a person with several punches reads
+     * down the cell in the order they worked them.
+     */
+    public function scopeForStoreBetween(Builder $query, int $storeId, string $from, string $to): Builder
+    {
+        return $query->where('store_id', $storeId)
+            ->whereBetween('business_date', [$from, $to])
+            ->orderBy('business_date')
+            ->orderBy('time_in');
+    }
+
+    /**
      * Clocked in, not yet out. A real, expected state — and one the day close
      * has to report separately, because there are no hours to approve yet.
      */

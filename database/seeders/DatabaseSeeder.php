@@ -22,6 +22,14 @@ class DatabaseSeeder extends Seeder
             'email' => 'test@example.com',
         ]);
 
-        $this->call(StoreSeeder::class);
+        $this->call([
+            StoreSeeder::class,
+            TestUserSeeder::class,
+        ]);
+
+        // NOT in the list above: it is the only seeder here that makes network
+        // calls, so a run without TCP credentials — CI, a fresh clone — would
+        // fail the whole seed over data the schema does not need. Run it on
+        // purpose: `php artisan db:seed --class=EmployeeSeeder`.
     }
 }

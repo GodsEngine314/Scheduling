@@ -29,6 +29,9 @@ beforeEach(function () {
     $this->today = app(BusinessDay::class)
         ->toLocal(DemoSeeder::STORE_ID, now())
         ->toDateString();
+
+    // Every route requires a token the auth service issued.
+    signIn();
 });
 
 it('redirects the root to the board', function () {
@@ -48,43 +51,39 @@ it('renders the board with the seeded day', function () {
         ->assertSee('Ben Ortiz');
 });
 
-it('shows the day as blocked, naming both blocker categories separately', function () {
+it('names both outstanding categories separately', function () {
     $response = $this->get('/board')->assertOk();
 
-    // An open punch has no hours to approve, so it must be reported apart from
-    // the unapproved ones rather than folded in with them.
+    // An open punch has no hours to approve, so it is reported apart from the
+    // unapproved ones rather than folded in with them. There is no close gated
+    // on this any more — it is information — but collapsing the two would still
+    // let somebody read a day as settled while a person's time was missing.
     $response->assertSee('unapproved')
         ->assertSee('open_punch')
-        ->assertSee('still clocked in, no hours to approve yet');
+        ->assertSee('Still clocked in, no hours to approve yet');
 });
 
-it('refuses to close a day that still has blockers', function () {
-    $this->post('/board/day-close', [
-        'store_id' => DemoSeeder::STORE_ID,
-        'date' => $this->today,
-    ])->assertRedirect();
-
-    expect(session('err'))->toContain('cannot close');
-});
-
-it('closes the day once every punch is out and approved', function () {
+it('reports nothing outstanding once every punch is out and approved', function () {
     foreach (WorkSegment::whereNull('time_out')->get() as $open) {
         $this->post("/board/segments/{$open->id}/punch-out");
     }
 
-    // One at a time, deliberately: there is no bulk approval any more. The
-    // manager signs off each employee's hours individually, which is the whole
-    // point of removing the button.
+    // One at a time, deliberately: there is no bulk approval. The manager signs
+    // off each employee's hours individually.
     foreach (WorkSegment::whereNotNull('time_out')->where('manager_approval', false)->get() as $segment) {
         $this->post("/board/segments/{$segment->id}/approve");
     }
 
-    $this->post('/board/day-close', [
-        'store_id' => DemoSeeder::STORE_ID,
-        'date' => $this->today,
-    ])->assertRedirect();
+    $this->get('/board')->assertOk()->assertSee('All settled');
+});
 
-    expect(session('ok'))->toContain('Day closed');
+it('offers no close control at all', function () {
+    // Neither day nor week. Approving hours is the meaningful act; there is no
+    // separate step that finalises a date, and nothing persists one.
+    $this->get('/board')
+        ->assertOk()
+        ->assertDontSee('Close the day')
+        ->assertDontSee('day-close', false);
 });
 
 it('adds a shift and flags it when it falls outside availability', function () {

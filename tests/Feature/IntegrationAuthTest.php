@@ -35,7 +35,7 @@ it('sends a TCP bearer token from the env without a token call', function () {
 
     Http::fake(['*' => Http::response(['data' => []], 200)]);
 
-    app(TcpClient::class)->employees(new EmployeeFilter(locationIds: ['9830400']));
+    app(TcpClient::class)->employees(new EmployeeFilter(locations: ['9830400']));
 
     Http::assertSent(fn ($r) => $r->hasHeader('Authorization', 'Bearer tcp-secret'));
 

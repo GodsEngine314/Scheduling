@@ -27,7 +27,12 @@ namespace App\DataTransferObjects;
 final readonly class WorkSegmentFilter
 {
     /**
-     * @param  array<int,int|string>  $locationIds  TCP location ids, NOT our store ids
+     * THERE IS NO LOCATION FILTER ON THIS ENDPOINT. Verified against the live
+     * API: `locations`, `locationIds` and an invented parameter name all return
+     * the identical 615 records for a date range. Scoping a sync to one store
+     * therefore means naming its employees, which is what tcpEmployeeIdsForStore
+     * is for and why the 20-value cap matters here.
+     *
      * @param  array<int,int|string>  $employeeIds
      * @param  array<int,int|string>  $jobCodeIds
      * @param  array<int,string>  $costCodeNames
@@ -38,7 +43,6 @@ final readonly class WorkSegmentFilter
      * @param  string|null  $updatedOnTo  ISO-8601
      */
     public function __construct(
-        public array $locationIds = [],
         public array $employeeIds = [],
         public array $jobCodeIds = [],
         public array $costCodeNames = [],
@@ -71,19 +75,16 @@ final readonly class WorkSegmentFilter
     {
         $cap = max(1, (int) config('tcp.filter_value_cap', 20));
 
-        foreach ($this->chunkValues($this->locationIds, $cap) as $locationIds) {
-            foreach ($this->chunkValues($this->employeeIds, $cap) as $employeeIds) {
-                foreach ($this->chunkValues($this->jobCodeIds, $cap) as $jobCodeIds) {
-                    foreach ($this->chunkValues($this->costCodeNames, $cap) as $costCodeNames) {
-                        foreach ($this->chunkValues($this->laborCodes, $cap) as $laborCodes) {
-                            yield $this->with([
-                                'locationIds' => $locationIds,
-                                'employeeIds' => $employeeIds,
-                                'jobCodeIds' => $jobCodeIds,
-                                'costCodeNames' => $costCodeNames,
-                                'laborCodes' => $laborCodes,
-                            ]);
-                        }
+        foreach ($this->chunkValues($this->employeeIds, $cap) as $employeeIds) {
+            foreach ($this->chunkValues($this->jobCodeIds, $cap) as $jobCodeIds) {
+                foreach ($this->chunkValues($this->costCodeNames, $cap) as $costCodeNames) {
+                    foreach ($this->chunkValues($this->laborCodes, $cap) as $laborCodes) {
+                        yield $this->with([
+                            'employeeIds' => $employeeIds,
+                            'jobCodeIds' => $jobCodeIds,
+                            'costCodeNames' => $costCodeNames,
+                            'laborCodes' => $laborCodes,
+                        ]);
                     }
                 }
             }
@@ -98,16 +99,15 @@ final readonly class WorkSegmentFilter
     public function toQuery(): array
     {
         $parameters = [
-            // GUESS, like every other name here: TCP's location records call
-            // the field `id` and the job codes call it `locationName`, so the
-            // plural query parameter is inferred from the employeeIds pattern.
-            'locationIds' => $this->locationIds,
             'employeeIds' => $this->employeeIds,
             'jobCodeIds' => $this->jobCodeIds,
             'costCodeNames' => $this->costCodeNames,
             'laborCodes' => $this->laborCodes,
             'startDate' => $this->startDate,
-            'endDate' => $this->endDate,
+            // CONFIRMED: the wire name is stopDate. Sending endDate earns a 400,
+            // "The 'start date' and 'stop date' must be set." The property keeps
+            // our vocabulary; this line is the translation.
+            'stopDate' => $this->endDate,
             'updatedOnFrom' => $this->updatedOnFrom,
             'updatedOnTo' => $this->updatedOnTo,
             'page' => $this->page,
@@ -164,7 +164,6 @@ final readonly class WorkSegmentFilter
     private function with(array $overrides): self
     {
         return new self(
-            $overrides['locationIds'] ?? $this->locationIds,
             $overrides['employeeIds'] ?? $this->employeeIds,
             $overrides['jobCodeIds'] ?? $this->jobCodeIds,
             $overrides['costCodeNames'] ?? $this->costCodeNames,

@@ -4,6 +4,7 @@ use App\Enums\TcpSyncState;
 use App\Jobs\PushEmployeeToTcp;
 use App\Jobs\PushWorkSegmentToTcp;
 use App\Models\Employee;
+use App\Models\IntegrationIdentity;
 use App\Models\Shift;
 use App\Models\WorkSegment;
 use App\Services\EventConsume\Handlers\EmployeeCreatedHandler;
@@ -64,6 +65,9 @@ beforeEach(function () {
     $this->seed(DemoSeeder::class);
     BusinessDay::flushTimezoneCache();
     $this->today = app(BusinessDay::class)->toLocal(DemoSeeder::STORE_ID, now())->toDateString();
+
+    // Every route requires a token the auth service issued.
+    signIn();
 });
 
 // ── work segments → TCP ─────────────────────────────────────────────────
@@ -162,7 +166,7 @@ it('sends a termination to TCP as an update, never a delete', function () {
     ])->save();
 
     // Give it an existing TCP id so this is an update path, not a create.
-    \App\Models\IntegrationIdentity::create([
+    IntegrationIdentity::create([
         'entity_type' => 'employee',
         'entity_id' => $employee->id,
         'system' => 'tcp',
@@ -193,7 +197,7 @@ it('records the TCP employee id in the owned table, not on the projection', func
     // integration_identities survives a projection rebuild; the employees row
     // does not. Putting the id we obtained onto the projection would mean the
     // next replay lost it and we created the person in TCP a second time.
-    $identity = \App\Models\IntegrationIdentity::where('entity_id', $employee->id)->firstOrFail();
+    $identity = IntegrationIdentity::where('entity_id', $employee->id)->firstOrFail();
 
     expect($identity->external_id)->toBe('E-77')
         ->and($identity->external_record_id)->toBe('R-88')

@@ -19,7 +19,7 @@ class WorkSegmentIndexRequest extends FormRequest
             'store' => ['required', 'integer', 'exists:stores,id'],
             'date' => ['required', 'date_format:Y-m-d'],
 
-            // The two day-close views, as filters.
+            // The two outstanding-hours views, as filters.
             'unapproved' => ['sometimes', 'boolean'],
             'open_punches' => ['sometimes', 'boolean'],
             'unmatched' => ['sometimes', 'boolean'],

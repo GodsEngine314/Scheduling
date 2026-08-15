@@ -1,5 +1,8 @@
 <?php
 
+use App\Models\User;
+use App\Services\Auth\TokenIntrospection;
+use App\Services\Auth\TokenIntrospector;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Tests\TestCase;
 
@@ -44,7 +47,62 @@ expect()->extend('toBeOne', function () {
 |
 */
 
-function something()
+/**
+ * Sign the test in, as the auth service would have.
+ *
+ * Every route in this service now requires a token the auth service issued, so
+ * a feature test that hits one has to say who it is.
+ *
+ * IT STUBS THE INTROSPECTOR RATHER THAN FAKING THE HTTP CALL, deliberately.
+ * Http::fake() stubs match in registration order and several files here register
+ * a '*' catch-all for a vendor; an introspection POST would match that first and
+ * be answered with a shift body, which reads as an invalid token and 401s the
+ * test for reasons that have nothing to do with what it was testing. Binding the
+ * introspector keeps the auth seam out of the vendor fakes entirely.
+ *
+ * The real introspection path is covered by AuthServiceTest, which fakes the
+ * HTTP call properly and asserts the request that goes out.
+ *
+ * Defaults to super-admin because most tests are about scheduling behaviour, not
+ * about permissions. Pass roles/permissions explicitly to test a gate.
+ *
+ * @param  array<int,string>  $roles
+ * @param  array<int,string>  $permissions
+ */
+function signIn(array $roles = ['super-admin'], array $permissions = [], ?int $userId = null, bool $authorized = true): void
 {
-    // ..
+    $userId ??= User::query()->value('id');
+
+    $introspection = new TokenIntrospection(
+        active: true,
+        authorized: $authorized,
+        userId: $userId === null ? null : (int) $userId,
+        name: $userId === null ? null : (string) User::query()->whereKey($userId)->value('name'),
+        email: null,
+        roles: $roles,
+        permissions: $permissions,
+    );
+
+    app()->instance(
+        TokenIntrospector::class,
+        new class($introspection) extends TokenIntrospector
+        {
+            // No parent::__construct(): the AuthServiceClient it would take is
+            // never touched on this path, and requiring one would drag the whole
+            // HTTP stack into a stub.
+            public function __construct(private readonly TokenIntrospection $result) {}
+
+            public function introspect(string $userToken, string $method, string $path, ?string $routeName = null): TokenIntrospection
+            {
+                return $this->result;
+            }
+
+            public function forget(string $userToken): void {}
+        }
+    );
+
+    // A token still has to be PRESENT — the middleware looks for one before it
+    // asks anything. The header works for the API and the console alike, which
+    // is why it is used rather than seeding a session.
+    test()->withHeader('Authorization', 'Bearer test-token');
 }

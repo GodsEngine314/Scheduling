@@ -30,6 +30,8 @@ class TcpClient extends AbstractApiClient
 
     private const WORK_SEGMENTS_PATH = '/worksegments';
 
+    private const JOB_CODES_PATH = '/jobcodes';
+
     /**
      * Pagination circuit breaker. At the configured page size this is far more
      * segments than any real filter can produce, so tripping it means the
@@ -72,16 +74,27 @@ class TcpClient extends AbstractApiClient
      */
     protected function defaultHeaders(): array
     {
-        $customerId = (string) (config('tcp.customer_id') ?? '');
+        $headers = [];
 
-        // An empty customer id means the header is not part of this tenant's
-        // contract. Sending it blank is a different request from not sending
-        // it, and some gateways reject the blank one.
-        if ($customerId === '') {
-            return [];
+        // The gateway key is not the bearer token and does not replace it: the
+        // token says who is calling, the key says this application may reach
+        // the gateway at all. Both go on every request.
+        $apiKey = trim((string) (config('tcp.api_key') ?? ''));
+
+        if ($apiKey !== '') {
+            $headers[(string) config('tcp.api_key_header', 'x-api-key')] = $apiKey;
         }
 
-        return [(string) config('tcp.customer_header', 'X-Customer-Id') => $customerId];
+        $customerId = trim((string) (config('tcp.customer_id') ?? ''));
+
+        // An empty value means the header is not part of this tenant's
+        // contract. Sending it blank is a different request from not sending
+        // it, and some gateways reject the blank one.
+        if ($customerId !== '') {
+            $headers[(string) config('tcp.customer_header', 'X-Customer-Id')] = $customerId;
+        }
+
+        return $headers;
     }
 
     /**
@@ -150,6 +163,60 @@ class TcpClient extends AbstractApiClient
 
         foreach ($filter->chunked() as $chunk) {
             $records = array_merge($records, $this->paginate(self::EMPLOYEES_PATH, $chunk->withPerPage($perPage)));
+        }
+
+        return $records;
+    }
+
+    /**
+     * Every job code TCP holds — all pages, no filter.
+     *
+     * READ-ONLY, and unfiltered on purpose: the endpoint takes no location
+     * parameter, and the store is encoded in the code itself. A job code reads
+     *
+     *     jobCodeId 37954202  "Crew Leader - 3795-42"
+     *                ^^^^ ^^ ^^
+     *                3795 42 02   franchise, store, role
+     *
+     * so the whole list is what tells you which position a punch's jobCodeId
+     * means. There are roughly six per store plus a handful of company-wide
+     * ones, which is one request at any sane page size.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    public function jobCodes(): array
+    {
+        $perPage = $this->pageSize();
+        $records = [];
+        $page = 1;
+
+        while (true) {
+            if ($page > self::MAX_PAGES) {
+                throw IntegrationException::guard(
+                    'tcp',
+                    $this->endpoint(self::JOB_CODES_PATH),
+                    'Pagination on '.self::JOB_CODES_PATH.' passed '.self::MAX_PAGES.' pages; the page parameter is being ignored.',
+                );
+            }
+
+            $batch = $this->records($this->get(self::JOB_CODES_PATH, [
+                'page' => $page,
+                'perPage' => $perPage,
+            ]));
+
+            if ($batch === []) {
+                break;
+            }
+
+            $records = array_merge($records, $batch);
+
+            // A short page is the last page — the same end-of-list signal
+            // paginate() uses, for the same reason: no trustworthy total.
+            if (count($batch) < $perPage) {
+                break;
+            }
+
+            $page++;
         }
 
         return $records;

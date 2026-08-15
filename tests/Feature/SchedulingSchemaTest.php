@@ -217,7 +217,7 @@ it('refuses two work segments claiming the same tcp segment id', function () {
 |--------------------------------------------------------------------------
 */
 
-it('answers the day-close question: unapproved hours and open punches', function () {
+it('answers the outstanding-hours question: unapproved hours and open punches', function () {
     makeStore();
     $approved = makeEmployee('Approved');
     $unapproved = makeEmployee('Unapproved');

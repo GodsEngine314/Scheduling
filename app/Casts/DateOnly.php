@@ -18,9 +18,9 @@ use Illuminate\Database\Eloquent\Model;
  * Every date-keyed lookup in this codebase then misses:
  *
  *   Shift::forBoard()                  where('business_date', '2026-08-07')
- *   WorkSegment::forBoard()            same, so the day-close gate sees no
- *                                      segments and reports a blocked day as
- *                                      closable — the exact failure the gate exists to prevent
+ *   WorkSegment::forBoard()            same, so the board sees no segments and
+ *                                      reports a day with unapproved hours and
+ *                                      open punches on it as entirely settled
  *   ReconciliationService::match()     candidate shifts never match, so every
  *                                      punch lands as unmatched
  *

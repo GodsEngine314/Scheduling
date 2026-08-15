@@ -14,22 +14,23 @@ namespace App\DataTransferObjects;
  * THE CROSS PRODUCT. The filters combine with AND, so splitting two lists at
  * once means asking for every combination of chunks.
  *
- * GUESS, and a more dangerous one here than usual: `locationIds` is inferred
- * from the employeeIds pattern. TCP's own location records call the field `id`
- * and its job codes call it `locationName`, so nothing confirms this spelling.
- * A filter parameter TCP does not recognise is likely to be IGNORED rather than
- * rejected — which returns every employee in the company and looks exactly like
- * a successful store-scoped pull. Confirm against a live response before
- * trusting a roster to be limited to one store.
+ * CONFIRMED AGAINST THE LIVE API, and the first guess was wrong in the exact way
+ * predicted: `locationIds` with a numeric id was silently IGNORED. It returned
+ * all 430 employees in the company and looked like a successful store-scoped
+ * pull — as did a parameter name invented on the spot.
+ *
+ * The parameter is `locations`, and its value is the STORE NUMBER string
+ * ("03795-00001"), not the numeric location id from GET /locations. That is what
+ * an employee record carries in its own `location` field, so the two agree.
  */
 final readonly class EmployeeFilter
 {
     /**
-     * @param  array<int,int|string>  $locationIds  TCP location ids, NOT our store ids
+     * @param  array<int,string>  $locations  store NUMBERS ("03795-00001"), not numeric ids
      * @param  array<int,int|string>  $employeeIds  TCP employee ids
      */
     public function __construct(
-        public array $locationIds = [],
+        public array $locations = [],
         public array $employeeIds = [],
         public ?int $page = null,
         public ?int $perPage = null,
@@ -55,10 +56,10 @@ final readonly class EmployeeFilter
     {
         $cap = max(1, (int) config('tcp.filter_value_cap', 20));
 
-        foreach ($this->chunkValues($this->locationIds, $cap) as $locationIds) {
+        foreach ($this->chunkValues($this->locations, $cap) as $locations) {
             foreach ($this->chunkValues($this->employeeIds, $cap) as $employeeIds) {
                 yield $this->with([
-                    'locationIds' => $locationIds,
+                    'locations' => $locations,
                     'employeeIds' => $employeeIds,
                 ]);
             }
@@ -73,7 +74,7 @@ final readonly class EmployeeFilter
     public function toQuery(): array
     {
         $parameters = [
-            'locationIds' => $this->locationIds,
+            'locations' => $this->locations,
             'employeeIds' => $this->employeeIds,
             'page' => $this->page,
             'perPage' => $this->perPage,
@@ -117,7 +118,7 @@ final readonly class EmployeeFilter
     private function with(array $overrides): self
     {
         return new self(
-            $overrides['locationIds'] ?? $this->locationIds,
+            $overrides['locations'] ?? $this->locations,
             $overrides['employeeIds'] ?? $this->employeeIds,
             $overrides['page'] ?? $this->page,
             $overrides['perPage'] ?? $this->perPage,

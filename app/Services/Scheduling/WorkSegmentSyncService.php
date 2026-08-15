@@ -2,15 +2,19 @@
 
 namespace App\Services\Scheduling;
 
+use App\DataTransferObjects\EmployeeFilter;
 use App\DataTransferObjects\WorkSegmentData;
 use App\DataTransferObjects\WorkSegmentFilter;
 use App\Enums\IntegrationEntityType;
 use App\Enums\IntegrationSystem;
 use App\Enums\MatchSource;
 use App\Enums\SegmentOrigin;
+use App\Enums\TcpSyncState;
 use App\Models\Employee;
 use App\Models\EmployeeStoreAssignment;
 use App\Models\IntegrationIdentity;
+use App\Models\Store;
+use App\Models\TcpJobCodeRole;
 use App\Models\WorkSegment;
 use App\Support\BusinessDay;
 use App\Support\Integrations\Tcp\TcpClient;
@@ -36,11 +40,26 @@ use Throwable;
  */
 class WorkSegmentSyncService
 {
+    /** timesDecision(): TCP's version wins. */
+    private const TIMES_ACCEPT = 'accept';
+
+    /** A local claim on the row beat it. This is the one worth reporting. */
+    private const TIMES_HELD = 'held';
+
+    /** Nothing to apply — the inbound record is no newer than the stored one. */
+    private const TIMES_STALE = 'stale';
+
     /** @var array<string, Employee|null> external TCP id => employee, per run */
     private array $employees = [];
 
     /** @var array<string, int|null> external TCP job code => position id, per run */
     private array $positions = [];
+
+    /** @var array<string, int|null> store_number => store id, per run */
+    private array $storesByNumber = [];
+
+    /** @var array<int, array<int, string>> store id => TCP's roster for it, per run */
+    private array $rosters = [];
 
     public function __construct(
         private readonly TcpClient $tcp,
@@ -56,36 +75,41 @@ class WorkSegmentSyncService
      */
     public function syncDate(string $date, ?int $storeId = null): array
     {
+        return $this->syncRange($date, $date, $storeId);
+    }
+
+    /**
+     * A span of business dates, optionally narrowed to one store.
+     *
+     * The week view pulls seven days, and it pulls them in ONE call rather than
+     * seven: the expensive part of a scoped sync is the employee-id filter,
+     * which is the same list for every day of the week, and TCP's rate limit is
+     * counted in requests rather than in days.
+     *
+     * @param  string  $from  Y-m-d
+     * @param  string  $to  Y-m-d, inclusive
+     * @return array<string, mixed>
+     */
+    public function syncRange(string $from, string $to, ?int $storeId = null): array
+    {
         if ($storeId === null) {
             return $this->sync(
-                new WorkSegmentFilter(startDate: $date, endDate: $date),
+                new WorkSegmentFilter(startDate: $from, endDate: $to),
                 null,
             );
         }
 
-        // The store's own TCP location id asks the question directly, and it is
-        // a strictly better question than the employee list below ever was.
-        // "The people we think work here" misses somebody covering from another
-        // store and wrongly pulls in one of ours covering elsewhere; a location
-        // filter is about where the punch happened, which is what a store-day
-        // board is actually asking. It also sidesteps the 20-value cap, since
-        // one store is one value.
-        $locationId = $this->tcpLocationIdForStore($storeId);
-
-        if ($locationId !== null) {
-            return $this->sync(
-                new WorkSegmentFilter(
-                    locationIds: [$locationId],
-                    startDate: $date,
-                    endDate: $date,
-                ),
-                $storeId,
-            );
-        }
-
-        // No mapping for this store yet. Fall back to the employee list rather
-        // than dropping the filter: an unmapped store is a missing
-        // integration_identities row, not permission to pull the whole estate.
+        // NAMING THE PEOPLE IS THE ONLY WAY. GET /worksegments has no location
+        // filter — verified against the live API, where `locations`,
+        // `locationIds` and a parameter invented on the spot all returned the
+        // identical 615 records. An earlier version of this method filtered by
+        // location and would have silently synced the whole estate into one
+        // store.
+        //
+        // The cost is the one the employee list always had: it asks about the
+        // people we think work here, so a cover shift from another store is
+        // missed. That is a real gap, and it is not one this endpoint lets us
+        // close.
         $employeeIds = $this->tcpEmployeeIdsForStore($storeId);
 
         if ($employeeIds === []) {
@@ -93,7 +117,7 @@ class WorkSegmentSyncService
             // employees" — sending it would quietly widen a one-store sync into
             // every store's punches for the day.
             return $this->report(0, 0, 0, 0, 0, [[
-                'reason' => 'store_has_no_tcp_location_or_employees',
+                'reason' => 'store_has_no_tcp_employees',
                 'store_id' => $storeId,
             ]]);
         }
@@ -101,8 +125,8 @@ class WorkSegmentSyncService
         return $this->sync(
             new WorkSegmentFilter(
                 employeeIds: $employeeIds,
-                startDate: $date,
-                endDate: $date,
+                startDate: $from,
+                endDate: $to,
             ),
             $storeId,
         );
@@ -267,18 +291,30 @@ class WorkSegmentSyncService
         }
 
         return $existing === null
-            ? $this->createSegment($data)
-            : $this->updateSegment($existing, $data);
+            ? $this->createSegment($data, $fields)
+            : $this->updateSegment($existing, $data, $fields);
     }
 
     /** @return array<string, mixed> */
-    private function createSegment(WorkSegmentData $data): array
+    private function createSegment(WorkSegmentData $data, array $fields = []): array
     {
+        // ON CREATE ONLY. TCP's approvals[] carries ManagerApproval and
+        // EmployeeApproval, so a punch that arrived already signed off there
+        // arrives signed off here rather than reappearing on somebody's list.
+        //
+        // updateSegment() still refuses to touch either column, and that has NOT
+        // changed: once this row exists, approval is ours. A later sweep must
+        // never un-approve hours a manager has put their name to — which is the
+        // whole reason those two are on its deliberate-exclusion list.
+        $approvals = $this->approvals($fields);
+
         $segment = DB::transaction(fn (): WorkSegment => WorkSegment::query()->create(
             $data->toArray() + [
                 'origin' => SegmentOrigin::TcpSync,
                 'match_source' => MatchSource::Unmatched,
-                'manager_approval' => false,
+                'manager_approval' => $approvals['manager'],
+                'employee_approval' => $approvals['employee'],
+                'approved_at' => $approvals['manager'] ? ($approvals['processed_on'] ?? now()) : null,
                 'tcp_synced_at' => now(),
             ],
         ));
@@ -292,11 +328,15 @@ class WorkSegmentSyncService
         ];
     }
 
-    /** @return array<string, mixed> */
-    private function updateSegment(WorkSegment $segment, WorkSegmentData $data): array
+    /**
+     * @param  array<string, mixed>  $fields
+     * @return array<string, mixed>
+     */
+    private function updateSegment(WorkSegment $segment, WorkSegmentData $data, array $fields = []): array
     {
         $inboundUpdatedOn = $this->parseUtc($data->tcpUpdatedOn);
-        $acceptTimes = $this->shouldAcceptTimes($segment, $inboundUpdatedOn);
+        $decision = $this->timesDecision($segment, $inboundUpdatedOn);
+        $acceptTimes = $decision === self::TIMES_ACCEPT;
 
         // Bookkeeping is refreshed either way. It is how anyone works out later
         // that TCP moved and we chose not to follow it: tcp_updated_on past
@@ -305,7 +345,7 @@ class WorkSegmentSyncService
             'tcp_payload' => $data->tcpPayload,
             'tcp_updated_on' => $data->tcpUpdatedOn,
             'tcp_synced_at' => now(),
-        ];
+        ] + $this->approvalFromTcp($segment, $fields);
 
         if ($acceptTimes) {
             $attributes += [
@@ -324,8 +364,6 @@ class WorkSegmentSyncService
         // Deliberately absent from $attributes in every branch:
         //   origin              — a manual_create row that later gains a TCP id
         //                         still records how it came to exist.
-        //   manager_approval    — approval is ours, TCP has no opinion on it.
-        //   employee_approval   —   "
         //   shift_id            — reconciliation's, and manual matches are a
         //   match_source        —   human's answer.
         $segment->forceFill($attributes);
@@ -343,9 +381,71 @@ class WorkSegmentSyncService
 
         return [
             'outcome' => $changed ? 'updated' : 'unchanged',
-            'held' => ! $acceptTimes,
+            // HELD means we REFUSED an inbound change, not that there was none
+            // to apply. Reporting the stale case as held made every re-pull of
+            // an unchanged day announce a conflict with every row in it.
+            'held' => $decision === self::TIMES_HELD,
             'work_segment_id' => (int) $segment->id,
             'tcp_segment_id' => $data->tcpSegmentId,
+        ];
+    }
+
+    /**
+     * TCP'S APPROVAL STATE, MIRRORED ONTO OURS.
+     *
+     * TCP owns approval. A punch approved there arrives approved here, a punch
+     * approved here is pushed there, and a re-sync brings back whatever TCP now
+     * says — which is the whole point: the two must not drift, because payroll
+     * pays from TCP's answer.
+     *
+     * This method exists because the sync used to skip these two columns
+     * entirely, on the reasoning that "approval is ours, TCP has no opinion on
+     * it". Under this ownership that is exactly backwards, and the failure was
+     * silent and permanent: a punch approved IN TCP after we first imported it
+     * sat in this console reading "requires approval" forever, because nothing
+     * ever revisited the flag.
+     *
+     * THE ONE THING IT WILL NOT DO is overwrite a local approval that has not
+     * reached TCP yet. tcp_sync_state = pending means a PushWorkSegmentToTcp job
+     * is still in flight with our answer; reading TCP's older "not approved"
+     * back over it would undo the manager's click a few seconds after they made
+     * it, and the push would then send a value we no longer hold.
+     *
+     * approved_by_user_id is left alone when TCP is the one approving: TCP's
+     * approverId is a TCP user, and that column is a foreign key into our users
+     * projection. It is cleared only when the approval itself goes away.
+     *
+     * @param  array<string, mixed>  $fields
+     * @return array<string, mixed>
+     */
+    private function approvalFromTcp(WorkSegment $segment, array $fields): array
+    {
+        if ($fields === [] || $segment->tcp_sync_state === TcpSyncState::Pending) {
+            return [];
+        }
+
+        $approvals = $this->approvals($fields);
+
+        $attributes = ['employee_approval' => $approvals['employee']];
+
+        if ($approvals['manager'] === (bool) $segment->manager_approval) {
+            // Agreed already. Leave approved_at and approved_by_user_id alone so
+            // a local approval keeps its attribution.
+            return $attributes;
+        }
+
+        if ($approvals['manager']) {
+            return $attributes + [
+                'manager_approval' => true,
+                'approved_at' => $approvals['processed_on'] ?? now(),
+            ];
+        }
+
+        // TCP no longer considers these hours signed off, so neither do we.
+        return $attributes + [
+            'manager_approval' => false,
+            'approved_at' => null,
+            'approved_by_user_id' => null,
         ];
     }
 
@@ -353,16 +453,13 @@ class WorkSegmentSyncService
      * PRECEDENCE — who wins when TCP and this database disagree.
      *
      * TCP owns punches, so an inbound sync normally wins. The exception is a
-     * human who has already acted on the row, because that is the one thing TCP
-     * cannot know about. Three rules, in order:
+     * human on THIS side whose change TCP has not seen yet, because that is the
+     * one thing TCP cannot know about. Three rules, in order:
      *
-     *   manager_approval = true — FROZEN. Somebody signed these hours off and
-     *       payroll may already have them. Moving approved times under an
-     *       approval is the worst outcome available here: the row still says
-     *       "approved" and now says something different from what was approved.
-     *       The bookkeeping columns are still refreshed, so a tcp_updated_on
-     *       later than approved_at is a findable "TCP disagrees with what you
-     *       signed".
+     *   tcp_sync_state = pending — FROZEN. A local edit or approval is still in
+     *       flight to TCP. Reading TCP's pre-change version back over it would
+     *       undo the change that is at this moment being sent, and the push
+     *       would then carry a value we no longer hold.
      *
      *   times_corrected_at set — a manager fixed the times by hand. TCP wins
      *       back only if TCP'S OWN RECORD changed after that correction
@@ -377,23 +474,45 @@ class WorkSegmentSyncService
      *       apply. "Provably" matters: if either side has no timestamp we
      *       cannot show the stored row is fresher, and TCP is the source of
      *       truth, so we take the inbound one.
+     *
+     * AN APPROVED ROW IS NO LONGER FROZEN ON THAT GROUND ALONE, and that is a
+     * deliberate consequence of TCP owning approval. It used to be, on the
+     * reasoning that payroll may already hold the approved figure — but under
+     * this ownership the approved figure IS TCP's, so refusing TCP's times while
+     * keeping TCP's approval flag produced a row that agreed with nothing. A
+     * local approval is still protected, by the pending rule above, until the
+     * push lands.
+     *
+     * THE THIRD OUTCOME IS NOT A REFUSAL. An inbound record no newer than the
+     * stored one has nothing to apply, which is the ordinary state of every row
+     * on a day nobody has touched since the last sweep. Calling that "held"
+     * — as this did while it returned a bare bool — made a re-pull of a quiet
+     * week report a conflict against every row in it, and the flash message
+     * says a conflict means TCP disagreed with a human. Three outcomes, so the
+     * count means what it claims.
+     *
+     * @return self::TIMES_*
      */
-    private function shouldAcceptTimes(WorkSegment $segment, ?CarbonImmutable $inboundUpdatedOn): bool
+    private function timesDecision(WorkSegment $segment, ?CarbonImmutable $inboundUpdatedOn): string
     {
-        if ($segment->manager_approval) {
-            return false;
+        if ($segment->tcp_sync_state === TcpSyncState::Pending) {
+            return self::TIMES_HELD;
         }
 
         if ($segment->times_corrected_at !== null) {
             return $inboundUpdatedOn !== null
-                && $inboundUpdatedOn->greaterThan($segment->times_corrected_at);
+                && $inboundUpdatedOn->greaterThan($segment->times_corrected_at)
+                    ? self::TIMES_ACCEPT
+                    : self::TIMES_HELD;
         }
 
         if ($inboundUpdatedOn !== null && $segment->tcp_updated_on !== null) {
-            return $inboundUpdatedOn->greaterThan($segment->tcp_updated_on);
+            return $inboundUpdatedOn->greaterThan($segment->tcp_updated_on)
+                ? self::TIMES_ACCEPT
+                : self::TIMES_STALE;
         }
 
-        return true;
+        return self::TIMES_ACCEPT;
     }
 
     /**
@@ -519,14 +638,115 @@ class WorkSegmentSyncService
      *
      * @param  array<string, mixed>  $fields
      */
+    /**
+     * The store a punch's own clock reports, from punchInInformation.
+     *
+     * The value is a terminal name — "03795-00042-0*" — whose first eleven
+     * characters are the store number. Matched against stores.store_number,
+     * which auth already gives us, so no id mapping is involved.
+     *
+     * Memoised per run: a day's punches at one store all carry the same string.
+     *
+     * @param  array<string, mixed>  $fields
+     */
+    private function storeIdFromPunchLocation(array $fields): ?int
+    {
+        foreach (['punchInInformation', 'punchOutInformation'] as $key) {
+            $info = $fields[strtolower($key)] ?? null;
+
+            if (! is_array($info)) {
+                continue;
+            }
+
+            $location = $this->string($info['punchLocation'] ?? $info['punchlocation'] ?? null);
+
+            if ($location === null || preg_match('/^(\d{4,6}-\d{4,6})/', $location, $m) !== 1) {
+                continue;
+            }
+
+            $number = $m[1];
+
+            if (array_key_exists($number, $this->storesByNumber)) {
+                return $this->storesByNumber[$number];
+            }
+
+            $id = Store::query()->where('store_number', $number)->value('id');
+
+            return $this->storesByNumber[$number] = $id === null ? null : (int) $id;
+        }
+
+        return null;
+    }
+
+    /**
+     * TCP's approvals[] reduced to the two booleans this schema keeps.
+     *
+     * CONFIRMED from live records. The list carries one entry per approval
+     * type, each with its own flag:
+     *
+     *   {"type":"ManagerApproval","approved":true,"approverId":"SMHARBOR","processedOn":"..."}
+     *   {"type":"EmployeeApproval","approved":false}
+     *   {"type":"OtherApproval","approved":false}
+     *
+     * OtherApproval is deliberately dropped — there is no column for it and
+     * folding it into either of the other two would misreport who signed off.
+     * approverId is TCP's own user, not one of ours, so it cannot go in
+     * approved_by_user_id, which is a foreign key into our users projection.
+     *
+     * @param  array<string, mixed>  $fields
+     * @return array{manager: bool, employee: bool, processed_on: ?string}
+     */
+    private function approvals(array $fields): array
+    {
+        $result = ['manager' => false, 'employee' => false, 'processed_on' => null];
+
+        $approvals = $fields['approvals'] ?? null;
+
+        if (! is_array($approvals)) {
+            return $result;
+        }
+
+        foreach ($approvals as $approval) {
+            if (! is_array($approval)) {
+                continue;
+            }
+
+            $type = strtolower($this->string($approval['type'] ?? null) ?? '');
+            $approved = ($approval['approved'] ?? false) === true;
+
+            if ($type === 'managerapproval') {
+                $result['manager'] = $approved;
+                $result['processed_on'] = $approved
+                    ? $this->parseUtc($this->string($approval['processedOn'] ?? null))?->format('Y-m-d H:i:s')
+                    : null;
+            }
+
+            if ($type === 'employeeapproval') {
+                $result['employee'] = $approved;
+            }
+        }
+
+        return $result;
+    }
+
     private function resolveStoreId(array $fields, Employee $employee, ?int $requestedStoreId): ?int
     {
-        // employeeDefaultLocationId is what the real payload carries, and the
-        // name is a warning: it is the employee's DEFAULT location, not
-        // necessarily where this punch happened. It is still the best evidence
-        // on the record, but it weakens the precedence below rather than
-        // settling it — somebody covering another store will be filed against
-        // their home store until TCP tells us otherwise.
+        // WHERE THE PUNCH ACTUALLY HAPPENED, and it took a live payload to find
+        // it. The documented schema suggested employeeDefaultLocationId, which
+        // never appears in a real record — and would have been the employee's
+        // HOME store anyway, not where they worked. The clock itself reports it:
+        //
+        //   punchInInformation.punchLocation = "03795-00042-0*"
+        //
+        // The store number is the leading NNNNN-NNNNN, and it matches
+        // stores.store_number directly. This is the one source here that
+        // survives somebody covering another store.
+        $storeId = $this->storeIdFromPunchLocation($fields);
+
+        if ($storeId !== null) {
+            return $storeId;
+        }
+
         $external = $this->string($this->pick($fields, [
             'employeeDefaultLocationId', 'employee_default_location_id',
             'locationId', 'location_id', 'location', 'siteId', 'site_id',
@@ -574,6 +794,20 @@ class WorkSegmentSyncService
             ->forExternalId(IntegrationSystem::Tcp, IntegrationEntityType::Position, $external)
             ->value('entity_id');
 
+        // THE ROLE SUFFIX, when the whole code is not mapped. A TCP job code is
+        // franchise + store + role — 37954202 is role 02 at store 3795-42 — and
+        // there are 237 of them for seven roles. PositionSeeder maps the role,
+        // not the code, so this is the lookup that resolves in practice.
+        //
+        // It is also what makes a NEW STORE need no seeding: 37954902 decodes
+        // through the same '02' the day that store opens.
+        //
+        // Company-wide codes are four digits (1000 Regular, 2000 Sick) and do
+        // not decode, so they stay null rather than borrowing role '00' — they
+        // are pay categories, and filing hours under a position nobody worked
+        // corrupts the labour report more quietly than an empty column.
+        $entityId ??= TcpJobCodeRole::positionIdFor($external);
+
         return $this->positions[$external] = $entityId === null ? null : (int) $entityId;
     }
 
@@ -615,34 +849,32 @@ class WorkSegmentSyncService
     }
 
     /**
-     * This store's TCP location id, or null when nobody has mapped it.
+     * The TCP ids of everyone who works at this store.
      *
-     * SCHEDULING-OWNED, and read from integration_identities rather than any
-     * column on the stores projection: a replay rebuilds stores from auth's
-     * events, which carry no TCP id, so a projected copy would vanish and every
-     * subsequent sync would silently fall back to the employee list.
+     * THE ONLY WAY to scope a sync, because GET /worksegments has no location
+     * filter — verified against the live API. So the store filter has to be
+     * expressed as "these people", and the question becomes: whose list?
      *
-     * Not memoised — one call per sync run.
-     */
-    private function tcpLocationIdForStore(int $storeId): ?string
-    {
-        $external = IntegrationIdentity::query()
-            ->forEntity(IntegrationEntityType::Store, $storeId, IntegrationSystem::Tcp)
-            ->value('external_id');
-
-        return $this->string($external);
-    }
-
-    /**
-     * The TCP ids of everyone who works at this store: primary store plus any
-     * explicit assignment, because a person can be scheduled somewhere that is
-     * not their primary store.
+     * BOTH, UNIONED, and each half covers the other's blind spot:
      *
-     * THE FALLBACK, not the main path. syncDate() prefers the store's TCP
-     * location id and only names people when that mapping is missing, because
-     * this list answers a subtly different question — who we think works here,
-     * rather than where the punch happened — and it is precisely the list that
-     * passes the vendor's 20-value cap and needs chunking.
+     *   TCP'S OWN ROSTER — GET /employees?locations={store_number}. Every TCP
+     *       employee record carries a `location` holding that same store number,
+     *       so this is the authority on who TCP files at this store, and it is
+     *       current. Our own table is a projection filled by hiring events and an
+     *       out-of-band seeder; somebody TCP added this morning is not in it, and
+     *       their punches would simply never be asked about.
+     *
+     *   OURS — primary store plus any explicit assignment. A cover shift arranged
+     *       on this side does not change TCP's `location` field, so this is the
+     *       half that knows about it.
+     *
+     * Widening the list cannot misfile anything: which store a punch lands on is
+     * decided per-record by resolveStoreId(), from the punch's own clock. Asking
+     * about somebody who did not work here costs one id in a filter and returns
+     * nothing.
+     *
+     * FALLS BACK TO OURS ALONE, quietly, when TCP cannot be reached. Losing the
+     * roster call must not lose the punches we could still have pulled.
      *
      * @return array<int, string>
      */
@@ -652,16 +884,66 @@ class WorkSegmentSyncService
             ->where('store_id', $storeId)
             ->pluck('employee_id');
 
-        return Employee::query()
+        $ours = Employee::query()
             ->whereNotNull('tcp_employee_id')
             ->where(fn (Builder $query): Builder => $query
                 ->where('primary_store_id', $storeId)
                 ->orWhereIn('id', $assigned))
             ->pluck('tcp_employee_id')
             ->map(static fn (mixed $id): string => (string) $id)
+            ->all();
+
+        return collect([...$this->tcpRosterForStore($storeId), ...$ours])
             ->unique()
             ->values()
             ->all();
+    }
+
+    /**
+     * Who TCP currently files at this store, straight from GET /employees.
+     *
+     * Memoised per run: a week's sync asks once, not once per chunk.
+     *
+     * The filter is the STORE NUMBER, not the numeric TCP location id — see
+     * TcpEmployeeReader, where `locationIds=9830400` was silently ignored and
+     * returned the whole company while `locations=03795-00001` returned that
+     * store's twenty.
+     *
+     * @return array<int, string>
+     */
+    private function tcpRosterForStore(int $storeId): array
+    {
+        if (array_key_exists($storeId, $this->rosters)) {
+            return $this->rosters[$storeId];
+        }
+
+        $storeNumber = $this->string(Store::query()->whereKey($storeId)->value('store_number'));
+
+        if ($storeNumber === null) {
+            return $this->rosters[$storeId] = [];
+        }
+
+        try {
+            $records = $this->tcp->employees(new EmployeeFilter(locations: [$storeNumber]));
+        } catch (Throwable) {
+            // Not configured, unreachable, rate-limited: all the same answer
+            // here, which is "use what we already know" rather than no punches.
+            return $this->rosters[$storeId] = [];
+        }
+
+        $ids = [];
+
+        foreach ($records as $record) {
+            $id = $this->string($this->pick($this->lowered($record), [
+                'employeeId', 'employee_id', 'employeeID', 'employeeNumber', 'employee_number',
+            ]));
+
+            if ($id !== null) {
+                $ids[] = $id;
+            }
+        }
+
+        return $this->rosters[$storeId] = array_values(array_unique($ids));
     }
 
     /** @param array<string, mixed> $fields */

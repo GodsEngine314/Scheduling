@@ -4,6 +4,7 @@ use App\Enums\IntegrationEntityType;
 use App\Enums\IntegrationSystem;
 use App\Models\Employee;
 use App\Models\IntegrationIdentity;
+use App\Models\Store;
 use App\Services\Scheduling\TcpEmployeeReader;
 use App\Support\BusinessDay;
 use Database\Seeders\DemoSeeder;
@@ -45,6 +46,9 @@ beforeEach(function () {
     BusinessDay::flushTimezoneCache();
 
     $this->reader = app(TcpEmployeeReader::class);
+
+    // Every route requires a token the auth service issued.
+    signIn();
 });
 
 /** TCP replies with one page of employees. */
@@ -60,7 +64,7 @@ function tcpIdentityFor(int $employeeId): ?IntegrationIdentity
         ->first();
 }
 
-it('asks TCP for the store location, never for our own store id', function () {
+it('filters by the store NUMBER, not the numeric location id', function () {
     fakeRoster([]);
 
     $this->reader->forStore(PULL_STORE_ID);
@@ -69,8 +73,23 @@ it('asks TCP for the store location, never for our own store id', function () {
         $query = [];
         parse_str((string) parse_url($request->url(), PHP_URL_QUERY), $query);
 
+        // Verified against the live API: `locationIds=9830400` is IGNORED and
+        // returns all 430 employees in the company, looking exactly like a
+        // successful store-scoped pull. `locations=03795-00001` returns 20.
         return str_contains((string) parse_url($request->url(), PHP_URL_PATH), '/employees')
-            && ($query['locationIds'] ?? null) === PULL_TCP_LOCATION_ID;
+            && ($query['locations'] ?? null) === '03795-00001'
+            && ! array_key_exists('locationIds', $query);
+    });
+});
+
+it('sends our own store id nowhere near the vendor', function () {
+    fakeRoster([]);
+
+    $this->reader->forStore(PULL_STORE_ID);
+
+    Http::assertSent(function ($request) {
+        // 379500001 is an id auth assigned; TCP has never heard of it.
+        return ! str_contains($request->url(), (string) PULL_STORE_ID);
     });
 });
 
@@ -155,17 +174,19 @@ it('keeps a TCP id with the employee already mapped to it', function () {
         ->and(tcpIdentityFor((int) $employees[1]->id))->toBeNull();
 });
 
-it('sends nothing when the store has no TCP location id', function () {
+it('sends nothing when the store has no store number to filter on', function () {
     fakeRoster([]);
 
-    // DemoSeeder's own store is not in the 03795 group and has no identity row.
+    // A store row with no number at all — nothing to put in the filter.
+    Store::query()->whereKey(DemoSeeder::STORE_ID)->update(['store_number' => '']);
+
     $report = $this->reader->forStore(DemoSeeder::STORE_ID);
 
-    // An unfiltered GET /employees would return the whole company, every one of
-    // whom would then look like they work at this store.
+    // An unfiltered GET /employees returns the whole company — measured at 430 —
+    // every one of whom would then look like they work at this store.
     Http::assertNothingSent();
 
-    expect(array_column($report['skipped'], 'reason'))->toContain('store_has_no_tcp_location');
+    expect(array_column($report['skipped'], 'reason'))->toContain('store_has_no_store_number');
 });
 
 it('sends nothing at all when TCP is not configured', function () {
@@ -182,25 +203,40 @@ it('sends nothing at all when TCP is not configured', function () {
 
 // ── the board only pulls when the store actually changes ────────────────
 
+/*
+ * Counted as "does landing again cost more", not as a fixed total.
+ *
+ * The first render of a store now costs more than one call: the board pulls the
+ * roster here, and BoardController also asks WorkSegmentSyncService for the
+ * day's punches, which resolves the store's TCP roster for itself. Asserting an
+ * absolute number would pin that arrangement rather than the rule these tests
+ * exist for — which is that landing on the SAME store again is free.
+ */
 it('pulls once when the board lands on a store, not on every render', function () {
     fakeRoster([]);
 
     $this->get('/board?store='.PULL_STORE_ID)->assertOk();
+    $afterFirst = count(Http::recorded());
+
     $this->get('/board?store='.PULL_STORE_ID.'&date='.now()->addDay()->toDateString())->assertOk();
     $this->get('/board?store='.PULL_STORE_ID)->assertOk();
 
     // Paging through dates on one store must not put a vendor round trip in
     // front of the board every time.
-    expect(Http::recorded())->toHaveCount(1);
+    expect(count(Http::recorded()))->toBe($afterFirst);
 });
 
 it('pulls again when the board moves to a different store', function () {
     fakeRoster([]);
 
     $this->get('/board?store='.PULL_STORE_ID)->assertOk();
+    $afterFirst = count(Http::recorded());
+
     $this->get('/board?store=379500002')->assertOk();
 
-    expect(Http::recorded())->toHaveCount(2);
+    // A different store is a different roster, and nothing already fetched
+    // answers for it.
+    expect(count(Http::recorded()))->toBeGreaterThan($afterFirst);
 });
 
 it('still renders the board when TCP is unreachable', function () {

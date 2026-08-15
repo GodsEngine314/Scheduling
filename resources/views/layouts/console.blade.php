@@ -84,6 +84,25 @@
   .chip-shift .t{display:block;font-weight:700}
   .chip-shift .m{display:block;color:var(--text-3)}
 
+  /* the week grid, actual side. Green is signed off, amber is work waiting for
+     somebody, and a dashed outline is a punch that has not finished happening. */
+  td.wk-cell.actual{background:var(--surface-2)}
+  .chip-seg{display:block;margin-bottom:3px;padding:3px 5px;border-radius:4px;
+    background:var(--actual-soft);border:1px solid var(--actual);color:var(--actual-ink);
+    font-family:var(--mono);font-size:9.5px;line-height:1.35}
+  .chip-seg.pending{background:var(--warn-soft);border-color:var(--warn);color:var(--warn)}
+  .chip-seg.open{background:repeating-linear-gradient(135deg,var(--actual-soft),
+    var(--actual-soft) 4px,transparent 4px,transparent 8px);border-style:dashed}
+  .chip-seg .t{display:block;font-weight:700}
+  .chip-seg .m{display:flex;gap:4px;align-items:center;justify-content:space-between;
+    color:var(--text-3);margin-top:1px}
+  .chip-seg .acts{display:flex;gap:2px;flex:0 0 auto}
+  .chip-seg .acts button{padding:0 4px;font-size:9px;min-height:15px;line-height:1.4}
+  td.wk-total,th.wk-total{width:110px;white-space:normal;vertical-align:top;padding:4px 8px}
+  .wk-total .n{font-family:var(--mono);font-size:11.5px;font-weight:700;color:var(--text)}
+  .wk-total .d{font-family:var(--mono);font-size:9.5px;color:var(--text-3);
+    display:flex;flex-wrap:wrap;gap:3px;margin-top:2px}
+
   .topbar{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;justify-content:space-between}
   .topbar-nav{display:flex;gap:4px}
   .topbar-nav a{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.03em;
@@ -160,38 +179,55 @@
 <body>
 <div class="wrap">
 
-  {{-- ── who is acting ──────────────────────────────────────────────────
-       Not a login. It records intent and restricts nothing — every route in
-       this service is still open — but an audit trail that cannot name an
-       actor is worthless, and several managers share one schedule. --}}
+  {{-- ── who is signed in ───────────────────────────────────────────────
+       A real identity now: the auth service verified the token this request
+       carried, and it is what every created_by_user_id is stamped with. The
+       roles shown are whatever the authority said on THIS request, not a copy
+       kept in the session. --}}
   @php
-      $acting = app(\App\Support\ActingUser::class)->current();
-      $consoleUsers = \App\Models\User::query()->orderBy('name')->get(['id', 'name']);
+      $auth = app(\App\Support\AuthContext::class);
+      // Parenthesised deliberately: && binds tighter than ??, so without them
+      // this reads the array key directly and blows up on every ordinary
+      // session, where there is no dev_bypass key at all.
+      $viaDevBypass = app(\App\Services\Auth\DevBypass::class)->enabled()
+          && ($auth->current()->raw['dev_bypass'] ?? false);
   @endphp
+
+  @if ($viaDevBypass)
+    {{-- Deliberately loud and on every page. A bypassed session looks exactly
+         like a real one everywhere else, and that is the point — but nobody
+         should be able to forget which one they are in. --}}
+    <div class="flash err" style="margin-bottom:12px">
+      <strong>LOCAL DEVELOPMENT BYPASS.</strong> Nobody checked a credential for this session,
+      and it holds super-admin. Set <code>AUTH_SERVICE_DEV_BYPASS=false</code> to require a real sign-in.
+    </div>
+  @endif
   <div class="card pad topbar">
     <nav class="topbar-nav">
       <a href="{{ route('board') }}" class="{{ request()->routeIs('board') ? 'on' : '' }}">Day</a>
       <a href="{{ route('board.week') }}" class="{{ request()->routeIs('board.week') ? 'on' : '' }}">Week</a>
+      <a href="{{ route('board.settings') }}" class="{{ request()->routeIs('board.settings') ? 'on' : '' }}">Settings</a>
     </nav>
 
-    <form method="POST" action="{{ route('acting-user') }}" class="ctl" style="gap:8px;align-items:center">
-      @csrf
-      <span class="lbl">Acting as</span>
-      <select name="user_id" onchange="this.form.submit()">
-        <option value="">— nobody —</option>
-        @foreach ($consoleUsers as $u)
-          <option value="{{ $u->id }}" @selected($acting?->id === $u->id)>{{ $u->name }}</option>
-        @endforeach
-      </select>
-      <noscript><button class="mini">Set</button></noscript>
-      <span class="note" style="font-size:10.5px">
-        @if ($acting === null)
-          <span style="color:var(--warn)">Nothing you do will be attributed.</span>
-        @else
-          Recorded on every change. <strong>Not a login</strong> — it restricts nothing.
-        @endif
-      </span>
-    </form>
+    <div class="ctl" style="gap:10px;align-items:center">
+      <span class="lbl">Signed in</span>
+      <span style="font-family:var(--mono);font-size:11.5px">{{ $auth->name() }}</span>
+
+      @if ($auth->roles() !== [])
+        <span class="chip {{ $auth->isSuperAdmin() ? 'warn' : 'neutral' }}">{{ implode(', ', $auth->roles()) }}</span>
+      @endif
+
+      @if ($auth->userId() === null && $auth->isAuthenticated())
+        {{-- Authenticated, but the users PROJECTION has not caught up with the
+             auth.v1.user.created event yet, so changes cannot be attributed to a
+             row that is not there. It resolves itself when the event lands. --}}
+        <span class="chip crit" title="The auth service knows this user; the local projection does not yet, so changes will be recorded unattributed">not projected yet</span>
+      @endif
+
+      <form method="POST" action="{{ route('logout') }}" class="inline">
+        @csrf<button class="mini">Sign out</button>
+      </form>
+    </div>
   </div>
 
   @if (session('ok'))   <div class="flash ok">{{ session('ok') }}</div>   @endif

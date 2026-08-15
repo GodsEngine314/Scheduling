@@ -57,6 +57,9 @@ beforeEach(function () {
             'sync_state' => 'synced',
         ]);
     }
+
+    // Every route requires a token the auth service issued.
+    signIn();
 });
 
 /**

@@ -137,6 +137,96 @@ class LaborCostEstimator
         ];
     }
 
+    /**
+     * What the hours somebody actually WORKED have cost.
+     *
+     * Deliberately a second method rather than a generalisation of
+     * estimateFor(), because the two disagree about what an hour is: a planned
+     * shift has no break and its hours are a subtraction, while a punch carries
+     * TCP's break_minutes and its hours column is the figure TCP and the
+     * corrections agree on.
+     *
+     * AN OPEN PUNCH CONTRIBUTES NOTHING. It has no end, so any number would be
+     * invented — it is counted separately instead, because a total that quietly
+     * swallowed it would read as a settled week when somebody is still on the
+     * clock.
+     *
+     * per_employee is KEYED BY employee_id, unlike estimateFor()'s list: the
+     * week grid looks a row's total up by id while drawing it, and re-indexing
+     * a list per row is the kind of thing that turns a grid into an N².
+     *
+     * @param  iterable<int, \App\Models\WorkSegment>  $segments
+     * @return array{
+     *     store_id: ?int,
+     *     actual_hours: float,
+     *     actual_cost: float,
+     *     unpriced_hours: float,
+     *     open_punches: int,
+     *     unapproved: int,
+     *     per_employee: array<int, array<string, mixed>>
+     * }
+     */
+    public function actualFor(iterable $segments, ?int $storeId = null): array
+    {
+        $actualHours = 0.0;
+        $actualCost = 0.0;
+        $unpricedHours = 0.0;
+        $openPunches = 0;
+        $unapproved = 0;
+        $perEmployee = [];
+
+        foreach ($segments as $segment) {
+            $employeeId = (int) $segment->employee_id;
+
+            $perEmployee[$employeeId] ??= [
+                'employee_id' => $employeeId,
+                'hours' => 0.0,
+                'cost' => 0.0,
+                'open_punches' => 0,
+                'unapproved' => 0,
+            ];
+
+            if ($segment->time_out === null) {
+                $openPunches++;
+                $perEmployee[$employeeId]['open_punches']++;
+
+                continue;
+            }
+
+            if (! $segment->manager_approval) {
+                $unapproved++;
+                $perEmployee[$employeeId]['unapproved']++;
+            }
+
+            $hours = (float) ($segment->hours ?? 0);
+            $actualHours += $hours;
+
+            $rate = $this->rateOn($employeeId, $this->dateString($segment->business_date));
+
+            if ($rate === null) {
+                $unpricedHours += $hours;
+            } else {
+                $actualCost += $hours * $rate->hourlyRate();
+            }
+
+            $perEmployee[$employeeId]['hours'] = round($perEmployee[$employeeId]['hours'] + $hours, 2);
+            $perEmployee[$employeeId]['cost'] = round(
+                $perEmployee[$employeeId]['cost'] + ($rate === null ? 0.0 : $hours * $rate->hourlyRate()),
+                2,
+            );
+        }
+
+        return [
+            'store_id' => $storeId,
+            'actual_hours' => round($actualHours, 2),
+            'actual_cost' => round($actualCost, 2),
+            'unpriced_hours' => round($unpricedHours, 2),
+            'open_punches' => $openPunches,
+            'unapproved' => $unapproved,
+            'per_employee' => $perEmployee,
+        ];
+    }
+
     private function dateString(CarbonInterface|string|null $date): string
     {
         return $date instanceof CarbonInterface ? $date->toDateString() : (string) $date;

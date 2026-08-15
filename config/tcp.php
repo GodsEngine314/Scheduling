@@ -46,6 +46,25 @@ return [
     'auth_prefix' => env('TCP_AUTH_PREFIX', 'Bearer'),
 
     /**
+     * A gateway API key, sent on every call ALONGSIDE the bearer token.
+     *
+     * These are two different things and both are required: the token says who
+     * is calling, the key says which application is allowed through the gateway
+     * at all. The token host (auth.api.tcplusondemand.com/oauth2/token) and the
+     * shape of the client id are Cognito-behind-API-Gateway, where the key
+     * conventionally rides as `x-api-key`.
+     *
+     * GUESS: the header NAME. If the gateway rejects the call with a 403 while
+     * the token itself is fine, this is the line to change.
+     *
+     * Empty means omit it entirely — sending a blank key is a different request
+     * from sending none, and gateways reject the blank one.
+     */
+    'api_key' => env('TCP_API_KEY'),
+
+    'api_key_header' => env('TCP_API_KEY_HEADER', 'x-api-key'),
+
+    /**
      * Some TCP tenants are addressed by a customer id alongside the token.
      * When TCP_CUSTOMER_ID is empty the header must be OMITTED ENTIRELY —
      * sending it blank is not the same as not sending it.
