@@ -1,5 +1,9 @@
 @extends('layouts.console')
-@section('title', ($view === 'actual' ? 'Actual' : 'Planned').' week — store '.$storeId.' — '.$weekStart)
+@section('title', match ($view) {
+    'actual' => 'Actual',
+    'planned' => 'Planned',
+    default => 'Plan vs actual',
+}.' week — store '.$storeId.' — '.$weekStart)
 
 @php
     use App\Support\BusinessDay;
@@ -11,7 +15,12 @@
     $prevWeek = \Carbon\CarbonImmutable::parse($weekStart)->subWeek()->toDateString();
     $nextWeek = \Carbon\CarbonImmutable::parse($weekStart)->addWeek()->toDateString();
 
-    $actual = $view === 'actual';
+    // $actual is kept as the "the actual side is on screen" flag the rest of
+    // this view already reads. $planned is its counterpart — in the combined
+    // view BOTH are true, which is the whole point.
+    $actual = $showActual;
+    $planned = $showPlanned;
+    $both = $showPlanned && $showActual;
 
     // Cells are addressed by "employee id or the string open" + date, which is
     // exactly what the drop handler posts back.
@@ -37,8 +46,11 @@
      holding both is unreadable the moment anybody works a split shift. --}}
 <div class="card pad">
   <nav class="topbar-nav" style="margin-bottom:8px">
-    <a href="{{ $tab('planned') }}" class="{{ $actual ? '' : 'on' }}">Planned shifts</a>
-    <a href="{{ $tab('actual') }}" class="{{ $actual ? 'on' : '' }}">
+    {{-- The default. Plan and actual stacked in one cell, which is the only
+         place the two can be compared day by day. --}}
+    <a href="{{ $tab('both') }}" class="{{ $both ? 'on' : '' }}">Plan vs actual</a>
+    <a href="{{ $tab('planned') }}" class="{{ $view === 'planned' ? 'on' : '' }}">Planned shifts</a>
+    <a href="{{ $tab('actual') }}" class="{{ $view === 'actual' ? 'on' : '' }}">
       Actual hours
       @if ($actuals['unapproved'] > 0)
         <span class="chip crit" style="margin-left:5px">{{ $actuals['unapproved'] }} to approve</span>
@@ -49,14 +61,32 @@
     </a>
   </nav>
   <p class="note" style="margin:0">
+    @if ($both)
+      <strong>Plan on top, worked underneath</strong>, one cell per person per day.
+      The purple chips are what we intended and can be dragged; the green ones are what TCP
+      recorded. A cell with a plan and no punch under it is a shift nobody clocked into; a punch
+      with no plan above it is hours nobody rostered.
+      <br>
+    @endif
     @if ($actual)
-      <strong>What was worked.</strong> Punches pulled from TCP with <code>GET /worksegments</code>.
-      A punch with no clock-out is somebody <strong>still in the store</strong> — it shows its clock-in
-      alone and cannot be approved, because there are no hours yet. Approve, correct or delete
-      each one here; every write is queued back to TCP.
-    @else
+      <strong>What was worked.</strong> Punches pulled from TCP with <code>GET /worksegments</code>,
+      one rectangle per punch. Approve, correct or delete each one here; every write is queued back
+      to TCP.
+      <br>
+      <span class="chip" style="background:var(--actual-soft);border-color:var(--actual);color:var(--actual-ink)">17:00–21:00</span>
+      in and out, a whole punch ·
+      <span class="chip" style="border-style:dashed;background:var(--actual-soft);border-color:var(--actual);color:var(--actual-ink)">17:00 → still in</span>
+      clocked in today and not out yet, so there are no hours to approve ·
+      <span class="chip warn" style="border-style:dashed">⚠ 17:00 → no out</span>
+      <strong>missed clock-out</strong> — the day ended and nobody closed it ·
+      <span class="chip warn" style="border-style:dashed">⚠ no punch</span>
+      <strong>missed clock-in</strong> — a shift was planned and nothing was ever recorded against it.
+      The two amber ones are holes in the timesheet, not hours.
+    @endif
+    @if ($planned)
+      @if ($actual) <br> @endif
       <strong>What we intend.</strong> Drag to build it, then publish the week to Humanity.
-      Nothing on this tab is sent to TCP, and nothing on the actual tab is sent to Humanity.
+      Nothing planned is sent to TCP, and no punch is ever sent to Humanity.
     @endif
   </p>
 </div>
@@ -77,7 +107,20 @@
           @endforeach
         </select>
       </label>
-      <label class="f"><span class="lbl">Week of</span><input type="date" name="week" value="{{ $weekStart }}"></label>
+      {{-- Tuesdays only. A free date box let you land on a Wednesday and wonder
+           why the grid still began on Tuesday; every option here IS a week, so
+           picking one and pressing Go can only mean one thing. The controller
+           still snaps any date it is given to that week's Tuesday, so an
+           old hand-typed ?week= link keeps working. --}}
+      <label class="f" style="min-width:230px"><span class="lbl">Week of (Tue)</span>
+        <select name="week" style="width:100%">
+          @foreach ($weeks as $w)
+            <option value="{{ $w['value'] }}" @selected($w['value'] === $weekStart)>
+              {{ $w['label'] }}@if ($w['current']) · this week @endif
+            </option>
+          @endforeach
+        </select>
+      </label>
       <button>Go</button>
       <a href="{{ $nav($prevWeek) }}"><button type="button">‹ prev</button></a>
       <a href="{{ $nav($nextWeek) }}"><button type="button">next ›</button></a>
@@ -120,11 +163,24 @@
         @if ($actuals['open_punches'] > 0) · {{ $actuals['open_punches'] }} still in @endif
       </div>
     </div>
-  @else
+  @endif
+
+  @if ($planned)
     <div class="card pad stat">
       <div class="lbl">Planned cost</div>
       <div class="v">${{ number_format((float) ($costs['planned_cost'] ?? 0), 2) }}</div>
-      <div class="s">{{ number_format((float) ($costs['planned_hours'] ?? 0), 2) }} h this week</div>
+      <div class="s">
+        {{ number_format((float) ($costs['planned_hours'] ?? 0), 2) }} h this week
+        @if ($both)
+          {{-- The comparison the split tabs could not make. Worked minus
+               planned, in hours, because "are we over" is the question. --}}
+          @php $delta = (float) ($actuals['actual_hours'] ?? 0) - (float) ($costs['planned_hours'] ?? 0); @endphp
+          <br>
+          <span class="chip {{ abs($delta) < 0.005 ? '' : ($delta > 0 ? 'warn' : 'neutral') }}">
+            {{ $delta > 0 ? '+' : '' }}{{ number_format($delta, 2) }} h worked vs planned
+          </span>
+        @endif
+      </div>
     </div>
 
     @include('board._publish', [
@@ -181,7 +237,9 @@
       leaves visible hours rather than losing them — and it arrives unapproved.
     </p>
   </div>
-@else
+@endif
+
+@if ($planned)
   {{-- ── add a shift ────────────────────────────────────────────────────── --}}
   <div class="card pad">
     <div class="lbl" style="margin-bottom:8px">Add a planned shift</div>
@@ -221,7 +279,8 @@
 
 {{-- ── the grid ───────────────────────────────────────────────────────── --}}
 <div class="card pad" style="overflow-x:auto">
-  <div class="lbl" style="margin-bottom:8px">The week · {{ $actual ? 'actual hours' : 'planned shifts' }}</div>
+  <div class="lbl" style="margin-bottom:8px">The week ·
+    {{ $both ? 'planned above, actual below' : ($actual ? 'actual hours' : 'planned shifts') }}</div>
 
   <table class="week">
     <thead>
@@ -255,21 +314,58 @@
             </div>
           </td>
           @foreach ($days as $d)
-            <td class="wk-cell {{ $actual ? 'actual' : '' }}" data-employee="{{ $e->id }}" data-date="{{ $d }}">
-              @if ($actual)
-                @foreach ($segCell($e->id, $d) as $g)
-                  @include('board._segment-chip', ['g' => $g])
-                @endforeach
-              @else
-                @foreach ($cell($e->id, $d) as $s)
+            {{-- STACKED, PLAN ON TOP. The cell stays a drop target in every
+                 view that shows the plan — the drag handlers key off .wk-cell
+                 and its two data attributes, not off which chips are inside. --}}
+            <td class="wk-cell {{ $actual ? 'actual' : '' }} {{ $both ? 'stacked' : '' }}"
+                data-employee="{{ $e->id }}" data-date="{{ $d }}">
+              @php
+                  $plannedHere = $planned ? $cell($e->id, $d) : collect();
+                  $workedHere = $actual ? $segCell($e->id, $d) : collect();
+              @endphp
+
+              @if ($planned)
+                @foreach ($plannedHere as $s)
                   @include('board._shift-chip', ['s' => $s, 'hhmm' => $hhmm])
                 @endforeach
+              @endif
+
+              @if ($both && $plannedHere->isNotEmpty() && $workedHere->isNotEmpty())
+                {{-- A rule, not a gap. Two chip colours alone do not survive a
+                     split shift stacked under a split plan. --}}
+                <div class="cell-rule"></div>
+              @endif
+
+              @if ($actual)
+                @foreach ($workedHere as $g)
+                  @include('board._segment-chip', ['g' => $g])
+                @endforeach
+                {{-- The gap the punches cannot show, because there is no punch:
+                     a shift that was planned on a day now past and never clocked
+                     into. Only when the cell has no punches at all — a shift with
+                     hours against it is accounted for, whichever shift they
+                     landed on. --}}
+                @if ($workedHere->isEmpty() && $d < $today)
+                  @foreach ($cell($e->id, $d)->where('work_segments_count', 0) as $s)
+                    @include('board._missed-chip', ['s' => $s])
+                  @endforeach
+                @endif
               @endif
             </td>
           @endforeach
           <td class="wk-total">
+            @if ($planned)
+              <div class="n" style="color:var(--planned)">
+                {{ number_format((float) ($plannedRow['hours'] ?? 0), 2) }}h
+                @if ($both) <span class="lbl" style="font-weight:400">plan</span> @endif
+              </div>
+              <div class="d">${{ number_format((float) ($plannedRow['cost'] ?? 0), 2) }}</div>
+            @endif
             @if ($actual)
-              <div class="n">{{ number_format((float) ($total['hours'] ?? 0), 2) }}h</div>
+              <div class="n" style="{{ $both ? 'color:var(--actual);margin-top:4px' : '' }}">
+                {{ number_format((float) ($total['hours'] ?? 0), 2) }}h
+                @if ($both) <span class="lbl" style="font-weight:400">worked</span> @endif
+              </div>
               <div class="d">
                 ${{ number_format((float) ($total['cost'] ?? 0), 2) }}
                 @if (($total['unapproved'] ?? 0) > 0)
@@ -279,18 +375,16 @@
                   <span class="chip warn">still in</span>
                 @endif
               </div>
-            @else
-              <div class="n">{{ number_format((float) ($plannedRow['hours'] ?? 0), 2) }}h</div>
-              <div class="d">${{ number_format((float) ($plannedRow['cost'] ?? 0), 2) }}</div>
             @endif
           </td>
         </tr>
       @endforeach
 
-      @unless ($actual)
+      @if ($planned)
         {{-- Open shifts get their own row so a shift can be dragged off a person
              entirely, which is how you un-assign without opening a form. There is
-             no counterpart on the actual side: a punch is always somebody. --}}
+             no counterpart on the actual side: a punch is always somebody, so
+             this row stays purely planned even in the combined view. --}}
         <tr>
           <td class="wk-name">
             <div class="n" style="color:var(--text-3)">— open shifts —</div>
@@ -305,28 +399,37 @@
           @endforeach
           <td class="wk-total"></td>
         </tr>
-      @endunless
+      @endif
     </tbody>
   </table>
 
-  @if ($actual)
-    <div class="legend">
-      <span><i class="key" style="background:var(--actual-soft);border:1px solid var(--actual)"></i>approved</span>
-      <span><i class="key" style="background:var(--warn-soft);border:1px solid var(--warn)"></i>worked, not approved</span>
+  <div class="legend">
+    @if ($planned)
+      <span><i class="key" style="background:var(--planned-soft);border:1px solid var(--planned)"></i>planned shift</span>
+    @endif
+    @if ($actual)
+      <span><i class="key" style="background:var(--actual-soft);border:1px solid var(--actual)"></i>worked, in and out</span>
       <span><i class="key" style="border:1px dashed var(--actual)"></i>still clocked in — no hours yet</span>
+      <span><i class="key" style="background:var(--warn-soft);border:1px dashed var(--warn)"></i>missed a clock-in or clock-out</span>
       <span>⚠ no planned shift behind the hours</span>
-    </div>
+    @endif
+  </div>
+  @if ($actual)
     <p class="note" style="margin-top:10px">
       <strong>✓</strong> approves one person's hours and pushes the approval to TCP.
       <strong>⋯</strong> opens the correction dialog, which is also where a punch is deleted.
       A correction clears the approval unless you say otherwise, so hours nobody has looked at
       since cannot sit there signed off.
     </p>
-  @else
+  @endif
+  @if ($planned)
     <p class="note" style="margin-top:10px">
       <strong>Drag</strong> a shift to another day or person to move it.
       <strong>Hold Ctrl (or Alt)</strong> while dropping to copy it instead, leaving the original.
       A shift with punches already reconciled against it cannot be moved — copy it, or delete the punches first.
+      @if ($both)
+        Only the purple planned chips drag; a punch is a record of something that already happened.
+      @endif
     </p>
   @endif
 </div>
@@ -467,7 +570,12 @@
   outEl.addEventListener('input', updateHint);
 })();
 </script>
-@else
+@endif
+
+{{-- Drag lives with the PLAN, so the combined view loads both this and the
+     correction dialog above. They touch different chips and different routes;
+     the only thing they share is the cell. --}}
+@if ($planned)
 <script>
 (() => {
   const csrf = @json(csrf_token());

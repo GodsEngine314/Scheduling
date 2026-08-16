@@ -45,7 +45,7 @@ beforeEach(function () {
             'tcp_employee_id' => (string) (55500 + $i),
         ])->save());
 
-    $this->monday = now()->parse('2026-08-10')->toDateString();
+    $this->tuesday = now()->parse('2026-08-11')->toDateString();
 
     signIn();
 });
@@ -94,22 +94,22 @@ function actualWeek(int $storeId, string $week)
 it('pulls the week from TCP when the actual tab first lands on it', function () {
     fakePunches([]);
 
-    actualWeek(DemoSeeder::STORE_ID, $this->monday)->assertOk();
+    actualWeek(DemoSeeder::STORE_ID, $this->tuesday)->assertOk();
 
     // The whole week in one request, not one call per day.
     Http::assertSent(function ($request) {
         return str_contains($request->url(), 'worksegments')
-            && str_contains($request->url(), '2026-08-10')
-            && str_contains($request->url(), '2026-08-16');
+            && str_contains($request->url(), '2026-08-11')
+            && str_contains($request->url(), '2026-08-17');
     });
 });
 
 it('does not pull again for the same store and week', function () {
     fakePunches([]);
 
-    actualWeek(DemoSeeder::STORE_ID, $this->monday)->assertOk();
-    actualWeek(DemoSeeder::STORE_ID, $this->monday)->assertOk();
-    actualWeek(DemoSeeder::STORE_ID, $this->monday)->assertOk();
+    actualWeek(DemoSeeder::STORE_ID, $this->tuesday)->assertOk();
+    actualWeek(DemoSeeder::STORE_ID, $this->tuesday)->assertOk();
+    actualWeek(DemoSeeder::STORE_ID, $this->tuesday)->assertOk();
 
     // Every approval and correction on this tab redirects back here. Without
     // this, each one would wait on TCP.
@@ -119,8 +119,8 @@ it('does not pull again for the same store and week', function () {
 it('pulls again when the week changes', function () {
     fakePunches([]);
 
-    actualWeek(DemoSeeder::STORE_ID, $this->monday)->assertOk();
-    actualWeek(DemoSeeder::STORE_ID, '2026-08-17')->assertOk();
+    actualWeek(DemoSeeder::STORE_ID, $this->tuesday)->assertOk();
+    actualWeek(DemoSeeder::STORE_ID, '2026-08-18')->assertOk();
 
     expect(punchRequests())->toBe(2);
 });
@@ -128,8 +128,10 @@ it('pulls again when the week changes', function () {
 it('does not pull for the planned tab', function () {
     Http::fake();
 
+    // Explicitly planned-only. The DEFAULT view is now the combined one, which
+    // shows worked hours and therefore does pull them.
     test()->get(route('board.week', [
-        'store' => DemoSeeder::STORE_ID, 'week' => $this->monday,
+        'store' => DemoSeeder::STORE_ID, 'week' => $this->tuesday, 'view' => 'planned',
     ]))->assertOk();
 
     // Planned shifts are ours. Nothing about that screen is TCP's business.
@@ -155,7 +157,7 @@ it('renders the punches it just pulled, not the ones it had', function () {
 
     expect(WorkSegment::query()->where('tcp_segment_id', 'seg-1')->exists())->toBeFalse();
 
-    actualWeek(DemoSeeder::STORE_ID, $this->monday)->assertOk();
+    actualWeek(DemoSeeder::STORE_ID, $this->tuesday)->assertOk();
 
     // The pull runs BEFORE the query, or the first render of a week shows the
     // punches it had rather than the ones it just fetched.
@@ -166,7 +168,7 @@ it('still renders the grid when TCP is down', function () {
     Http::fake(['*' => Http::response('gateway timeout', 504)]);
 
     // A convenience that fails is a message, never a broken screen.
-    actualWeek(DemoSeeder::STORE_ID, $this->monday)
+    actualWeek(DemoSeeder::STORE_ID, $this->tuesday)
         ->assertOk()
         ->assertSee('Actual hours', false);
 });
@@ -174,10 +176,10 @@ it('still renders the grid when TCP is down', function () {
 it('does not retry a failed week on every render', function () {
     Http::fake(['*' => Http::response('gateway timeout', 504)]);
 
-    actualWeek(DemoSeeder::STORE_ID, $this->monday)->assertOk();
+    actualWeek(DemoSeeder::STORE_ID, $this->tuesday)->assertOk();
     $afterFirst = count(Http::recorded());
 
-    actualWeek(DemoSeeder::STORE_ID, $this->monday)->assertOk();
+    actualWeek(DemoSeeder::STORE_ID, $this->tuesday)->assertOk();
 
     // Recorded before the call, so a store whose pull fails does not spend the
     // retry budget again on every subsequent render of the same grid.
@@ -187,7 +189,7 @@ it('does not retry a failed week on every render', function () {
 it('makes one request for the week, not one per day', function () {
     fakePunches([]);
 
-    actualWeek(DemoSeeder::STORE_ID, $this->monday)->assertOk();
+    actualWeek(DemoSeeder::STORE_ID, $this->tuesday)->assertOk();
 
     // The filter takes a range, and a week's employee list is the same list
     // seven times over.

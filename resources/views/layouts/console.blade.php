@@ -90,9 +90,30 @@
   .chip-seg{display:block;margin-bottom:3px;padding:3px 5px;border-radius:4px;
     background:var(--actual-soft);border:1px solid var(--actual);color:var(--actual-ink);
     font-family:var(--mono);font-size:9.5px;line-height:1.35}
-  .chip-seg.pending{background:var(--warn-soft);border-color:var(--warn);color:var(--warn)}
+  /* The colour says whether the punch is WHOLE — that is what you scan a week
+     for. Approval is the smaller mark below, because a signed-off punch and an
+     unsigned one are both real records of hours worked, while a punch missing
+     half of itself is a hole in the timesheet. */
+  .chip-seg.done{background:var(--actual-soft);border-color:var(--actual);color:var(--actual-ink)}
+  /* In the store right now. Green like a whole punch — nothing is wrong with
+     it — but hatched and dashed so it reads as unfinished rather than done. */
   .chip-seg.open{background:repeating-linear-gradient(135deg,var(--actual-soft),
     var(--actual-soft) 4px,transparent 4px,transparent 8px);border-style:dashed}
+  /* Missed a clock-out, or never clocked in at all. Amber: somebody has to fix
+     this before the week's hours mean anything. */
+  .chip-seg.missed{background:var(--warn-soft);border-color:var(--warn);color:var(--warn);
+    border-style:dashed}
+  /* No punch exists at all, so there is nothing to click. */
+  .chip-seg.missing-in{opacity:.92}
+  /* Signed off. A quiet left edge, not a background — see above. */
+  .chip-seg.is-approved{box-shadow:inset 2px 0 0 var(--ok)}
+
+  /* The combined cell: plan above, worked below, separated by a rule rather
+     than by colour alone — two chip colours do not survive a split shift
+     stacked under a split plan, which is the case the split tabs existed to
+     avoid. Wider, because it now holds two stacks. */
+  td.wk-cell.stacked{min-width:132px}
+  .cell-rule{height:0;margin:4px 0;border-top:1px dashed var(--line-2)}
   .chip-seg .t{display:block;font-weight:700}
   .chip-seg .m{display:flex;gap:4px;align-items:center;justify-content:space-between;
     color:var(--text-3);margin-top:1px}

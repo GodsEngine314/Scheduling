@@ -349,12 +349,45 @@ class BoardController extends Controller
         $anchor = (string) ($request->query('week')
             ?: $this->businessDay->toLocal($storeId, now())->toDateString());
 
-        $view = $request->query('view') === 'actual' ? 'actual' : 'planned';
+        /**
+         * Three readings of the same seven days, and BOTH is the default.
+         *
+         * They were two tabs because they answer different questions — "who is
+         * working Thursday" and "did Thursday get worked" — and because one cell
+         * holding both gets crowded the moment somebody works a split shift.
+         * That crowding is real and the stacked cell below is built around it:
+         * plan on top, worked underneath, a rule between them.
+         *
+         * What the split cost was the comparison. Plan and actual side by side
+         * in one cell is the only way to see that Thursday was staffed for four
+         * and worked by three, which is the question a week grid is actually
+         * read for. The single-purpose tabs stay for the two jobs that want the
+         * room: dragging out a plan, and signing off a week of hours.
+         */
+        $view = match ($request->query('view')) {
+            'planned' => 'planned',
+            'actual' => 'actual',
+            default => 'both',
+        };
 
-        // Monday-first. startOfWeek() honours the app locale, which is not a
-        // decision this screen should inherit silently.
-        $start = CarbonImmutable::parse($anchor)->startOfWeek(CarbonInterface::MONDAY);
+        $showPlanned = $view !== 'actual';
+        $showActual = $view !== 'planned';
+
+        // TUESDAY-FIRST, and stated explicitly rather than left to startOfWeek()'s
+        // locale default — which would be Sunday or Monday depending on a config
+        // value that has nothing to do with how these stores run.
+        //
+        // This is also what makes the date box work as a week picker: ANY date
+        // lands on the Tuesday of the week containing it, so picking a Thursday
+        // shows Thursday's week rather than starting the grid on Thursday.
+        $start = CarbonImmutable::parse($anchor)->startOfWeek(CarbonInterface::TUESDAY);
         $days = collect(range(0, 6))->map(fn (int $i): string => $start->addDays($i)->toDateString());
+
+        // Store-local today, for telling "still in the store" from "never
+        // clocked out". Both are a punch with no time_out; only the date says
+        // which, and it has to be the STORE's date — a board read at 01:00 UTC
+        // is still the previous evening in New York.
+        $today = $this->businessDay->toLocal($storeId, now())->toDateString();
 
         $shifts = Shift::query()
             ->with(['employee', 'position'])
@@ -367,7 +400,7 @@ class BoardController extends Controller
 
         // BEFORE the query, or the first render of a week shows the punches it
         // had rather than the ones it just fetched.
-        if ($view === 'actual') {
+        if ($showActual) {
             $this->pullSegmentsOnRangeChange($request, $storeId, $days->first(), $days->last());
         }
 
@@ -383,7 +416,11 @@ class BoardController extends Controller
             'storeId' => $storeId,
             'weekStart' => $start->toDateString(),
             'days' => $days->all(),
+            'today' => $today,
+            'weeks' => $this->selectableWeeks($storeId, $start),
             'view' => $view,
+            'showPlanned' => $showPlanned,
+            'showActual' => $showActual,
             'shifts' => $shifts,
             'segments' => $segments,
             'byCell' => $shifts->groupBy([
@@ -399,7 +436,11 @@ class BoardController extends Controller
             // The forms offer the roster. The GRID has to show more than that on
             // the actual side — see rowsForActual().
             'roster' => $roster,
-            'rows' => $view === 'actual' ? $this->rowsForActual($roster, $segments, $days->first()) : $roster,
+            // Anyone who PUNCHED here is a row, even off the roster — otherwise
+            // a cover shift from another store has hours nothing on the grid
+            // accounts for. Only when the actual side is on screen; a pure
+            // planning view has nothing to say about them.
+            'rows' => $showActual ? $this->rowsForActual($roster, $segments, $days->first()) : $roster,
             'positions' => Position::query()->orderBy('id')->get(),
             'costs' => $this->costs->estimateFor($shifts, $storeId, null),
             'actuals' => $this->costs->actualFor($segments, $storeId),
@@ -458,6 +499,41 @@ class BoardController extends Controller
             ->all();
 
         return [...$roster, ...$strays];
+    }
+
+    /**
+     * The weeks the picker offers: Tuesdays, and nothing else.
+     *
+     * A free date box let you land on a Wednesday and wonder why the grid still
+     * began on Tuesday. Offering only week starts removes the question — every
+     * option IS a week, so picking one and pressing Go can only mean one thing.
+     *
+     * Centred on the store's current week rather than on the one being viewed,
+     * so the list does not crawl away from "now" as you page through it. The
+     * week actually on screen is always included even when it falls outside the
+     * window, or a deep link to last spring would render with nothing selected.
+     *
+     * @return array<int, array{value: string, label: string, current: bool}>
+     */
+    private function selectableWeeks(int $storeId, CarbonImmutable $viewing): array
+    {
+        $thisWeek = CarbonImmutable::parse($this->businessDay->toLocal($storeId, now())->toDateString())
+            ->startOfWeek(CarbonInterface::TUESDAY);
+
+        $starts = collect(range(-16, 8))
+            ->map(fn (int $offset): CarbonImmutable => $thisWeek->addWeeks($offset))
+            ->push($viewing)
+            ->unique(fn (CarbonImmutable $date): string => $date->toDateString())
+            ->sortBy(fn (CarbonImmutable $date): string => $date->toDateString())
+            ->values();
+
+        return $starts->map(fn (CarbonImmutable $date): array => [
+            'value' => $date->toDateString(),
+            // Both ends, because "week of 11 Aug" is ambiguous the moment the
+            // week does not start on the day the reader assumes it does.
+            'label' => $date->format('D j M Y').' → '.$date->addDays(6)->format('D j M'),
+            'current' => $date->equalTo($thisWeek),
+        ])->all();
     }
 
     /**

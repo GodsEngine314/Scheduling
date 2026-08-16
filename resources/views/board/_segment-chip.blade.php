@@ -1,14 +1,21 @@
 {{-- One punch in a week cell — the ACTUAL side of the grid.
-     $g = WorkSegment (with employee, position), plus $bd and $storeId from the
-     parent view.
+     $g = WorkSegment (with employee, position), plus $bd, $storeId and $today
+     from the parent view.
 
-     THREE STATES, AND THE DIFFERENCE MATTERS MORE THAN THE TIMES DO:
+     THE COLOUR ENCODES WHETHER THE PUNCH IS WHOLE, because that is the thing
+     you scan a week for. Approval is a separate, smaller mark: a signed-off
+     punch and an unsigned one are both real records of worked hours, whereas a
+     punch missing half of itself is a hole in the timesheet.
 
-       open      clocked in, no clock-out. Somebody is in the store right now.
-                 There are no hours yet, so there is nothing to approve — the
-                 service refuses it, and the chip does not offer it.
-       pending   a finished punch nobody has signed off. This is the work.
-       approved  signed off, and pushed to TCP as an approval. --}}
+       done      in and out. Green. The ordinary case, and most of the grid.
+       open      clocked in TODAY and not out yet — somebody is in the store
+                 right now. Shows only the in time, because there is no out.
+       missed    clocked in on a day that has since ENDED and never clocked out.
+                 Same missing field as `open`, completely different meaning: this
+                 one is a hole somebody has to correct. Amber, and marked ⚠.
+
+     Both `open` and `missed` are "time_out IS NULL". Only the date tells them
+     apart, and it has to be the STORE's date — see $today in BoardController. --}}
 @php
     $open = $g->time_out === null;
     $approved = (bool) $g->manager_approval;
@@ -18,24 +25,34 @@
 
     $businessDate = $g->business_date?->toDateString();
 
+    // The day this punch belongs to is over, so nobody is coming back to clock
+    // out of it.
+    $missedOut = $open && $businessDate !== null && $businessDate < $today;
+    $stillIn = $open && ! $missedOut;
+
     // A punch that ran past midnight clocks out on the NEXT local day. Marked
     // with a ⁺ rather than left bare: 17:00–02:00 is an eight-hour night, and
     // unmarked it reads as fifteen hours of nonsense.
     $crossed = $outLocal !== null && $outLocal->toDateString() !== $inLocal->toDateString();
 
     $state = match (true) {
-        $open => 'open',
-        $approved => 'approved',
-        default => 'pending',
+        $missedOut => 'missed',
+        $stillIn => 'open',
+        default => 'done',
     };
 
     $tip = ['Punch #'.$g->id.($g->position ? ' · '.$g->position->label : '')];
 
-    $tip[] = $open
-        ? 'Clocked in at '.$inLocal->format('H:i').', still in the store. No hours to approve until they clock out.'
-        : number_format((float) $g->hours, 2).' h'
+    $tip[] = match (true) {
+        $missedOut => 'MISSED CLOCK-OUT. Clocked in at '.$inLocal->format('H:i')
+            .' on '.$businessDate.' and never clocked out, and that day has ended.'
+            .' Correct the times to close it — there are no hours until you do.',
+        $stillIn => 'Clocked in at '.$inLocal->format('H:i').', still in the store.'
+            .' No hours to approve until they clock out.',
+        default => number_format((float) $g->hours, 2).' h'
             .((int) $g->break_minutes > 0 ? ' (after a '.$g->break_minutes.' min break)' : '')
-            .' · '.($approved ? 'approved' : 'NOT approved yet');
+            .' · '.($approved ? 'approved' : 'NOT approved yet'),
+    };
 
     if ($g->shift_id === null) {
         $tip[] = 'No planned shift behind these hours.';
@@ -44,7 +61,7 @@
     $tip[] = 'TCP '.($g->tcp_segment_id ? '#'.$g->tcp_segment_id : 'id not issued yet')
         .' · '.$g->tcp_sync_state?->label();
 @endphp
-<div class="chip-seg {{ $state }}"
+<div class="chip-seg {{ $state }} {{ $approved ? 'is-approved' : '' }}"
      data-seg="{{ $g->id }}"
      data-who="{{ $g->employee?->fullName() }}"
      data-date="{{ $businessDate }}"
@@ -61,7 +78,9 @@
      data-delete-url="{{ route('board.segments.destroy', $g) }}"
      title="{{ implode("\n", $tip) }}">
   <span class="t">
-    @if ($open)
+    @if ($missedOut)
+      ⚠ {{ $inLocal->format('H:i') }} → <em style="font-style:normal">no out</em>
+    @elseif ($stillIn)
       {{ $inLocal->format('H:i') }} → <em style="font-style:normal">still in</em>
     @else
       {{ $inLocal->format('H:i') }}–{{ $outLocal->format('H:i') }}{{ $crossed ? '⁺' : '' }}
@@ -69,8 +88,15 @@
   </span>
   <span class="m">
     <span>
-      #{{ $g->id }}
-      @if (! $open) · {{ number_format((float) $g->hours, 2) }}h @endif
+      @if ($missedOut)
+        missed out
+      @else
+        #{{ $g->id }}
+        @if (! $open) · {{ number_format((float) $g->hours, 2) }}h @endif
+        {{-- Approval, demoted to a mark now that the background carries whether
+             the punch is whole. Only meaningful on a finished punch. --}}
+        @if (! $open && $approved) · ✓ @endif
+      @endif
       @if ($g->shift_id === null) ⚠ @endif
     </span>
     <span class="acts">

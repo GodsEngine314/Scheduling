@@ -56,8 +56,16 @@ function unapprovedPunch(): WorkSegment
 
 // ── the two views ───────────────────────────────────────────────────────
 
-it('reads the same week twice, defaulting to the planned side', function () {
-    $planned = $this->get('/board/week')->assertOk();
+it('reads the same week three ways, defaulting to plan against actual', function () {
+    // The default is the COMBINED view: both stacks in one cell, because the
+    // question a week grid is read for is how the two compare.
+    $this->get('/board/week')
+        ->assertOk()
+        ->assertSee('Plan vs actual')
+        ->assertSee('data-shift=', false)
+        ->assertSee('data-seg=', false);
+
+    $planned = $this->get('/board/week?view=planned')->assertOk();
 
     $planned->assertSee('Planned shifts')
         ->assertSee('Actual hours')
@@ -277,7 +285,9 @@ it('refuses a hand-entered punch whose clocks are identical', function () {
 // ── pulling the week from TCP ───────────────────────────────────────────
 
 it('pulls the whole week from TCP in one call, not seven', function () {
-    $monday = now()->parse($this->today)->startOfWeek(Carbon\CarbonInterface::MONDAY)->toDateString();
+    // TUESDAY-first, matching BoardController::week(). The grid runs Tuesday to
+    // Monday, so the range the sync is asked for has to run the same way.
+    $monday = now()->parse($this->today)->startOfWeek(Carbon\CarbonInterface::TUESDAY)->toDateString();
     $sunday = now()->parse($monday)->addDays(6)->toDateString();
 
     $this->mock(WorkSegmentSyncService::class)
@@ -317,8 +327,8 @@ it('still pulls a single day when no span is given', function () {
 it('totals worked hours without inventing any for the open punch', function () {
     $segments = WorkSegment::query()->forStoreBetween(
         DemoSeeder::STORE_ID,
-        now()->parse($this->today)->startOfWeek(Carbon\CarbonInterface::MONDAY)->toDateString(),
-        now()->parse($this->today)->endOfWeek(Carbon\CarbonInterface::SUNDAY)->toDateString(),
+        now()->parse($this->today)->startOfWeek(Carbon\CarbonInterface::TUESDAY)->toDateString(),
+        now()->parse($this->today)->startOfWeek(Carbon\CarbonInterface::TUESDAY)->addDays(6)->toDateString(),
     )->get();
 
     $totals = app(LaborCostEstimator::class)->actualFor($segments, DemoSeeder::STORE_ID);
@@ -361,7 +371,8 @@ it('gives a row to somebody who punched here but is off the roster', function ()
         ->assertSee('off roster')
         ->assertSee('data-seg="'.$segment->id.'"', false);
 
-    // And they are NOT offered as somebody to schedule or to record new hours
-    // against: the roster is still the roster.
-    $this->get('/board/week')->assertOk()->assertDontSee($employee->fullName());
+    // And they are gone entirely from the PURE planning view: the roster is
+    // still the roster, and they cannot be scheduled. (The combined view does
+    // show them, correctly — their hours are real and have to land somewhere.)
+    $this->get('/board/week?view=planned')->assertOk()->assertDontSee($employee->fullName());
 });
