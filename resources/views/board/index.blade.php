@@ -23,6 +23,19 @@
 
     $byEmployee = $shifts->groupBy('employee_id');
     $segsByEmployee = $segments->groupBy('employee_id');
+
+    // ── what the position dropdowns offer ─────────────────────────────────
+    // ONLY ROLES TCP HAS A JOB CODE FOR, same rule and same source as the week
+    // view. Driver, Insider and Shift Lead are in the positions table and in no
+    // TCP code anywhere; a shift rostered against one becomes hours the
+    // timeclock refuses. See TcpJobCodeRole::positionIdsOfferableAt().
+    $filable = $offerablePositionIds === []
+        ? $positions
+        : $positions->whereIn('id', $offerablePositionIds);
+
+    // Whether the list above is THIS store's or just the estate's — [] from the
+    // strict lookup means TCP does not carry this store at all.
+    $storeInTcp = $pushablePositionIds !== [];
 @endphp
 
 @section('content')
@@ -126,9 +139,12 @@
         @endforeach
       </select>
     </label>
+    {{-- Only roles TCP can file. A plan itself goes to Humanity, which has never
+         heard of a job code, but the hours somebody works against this shift go
+         to TCP — and a Driver shift produces hours it will refuse. --}}
     <label class="f"><span class="lbl">Position</span>
       <select name="position_id">
-        @foreach ($positions as $p)<option value="{{ $p->id }}">{{ $p->label }}</option>@endforeach
+        @foreach ($filable as $p)<option value="{{ $p->id }}">{{ $p->label }}</option>@endforeach
       </select>
     </label>
     <label class="f"><span class="lbl">Start</span><input type="time" name="start" value="17:00" required></label>
@@ -144,6 +160,17 @@
     An end at or before the start crosses midnight — try <code>21:00</code> to <code>01:00</code>.
     Availability is checked but never blocks the save.
   </p>
+  @unless ($storeInTcp)
+    {{-- The roles on offer are the estate's, not this store's: TCP carries no job
+         codes for it, so hours worked against anything rostered here cannot be
+         filed until the store is mapped. --}}
+    <p class="note" style="margin-top:6px;color:var(--warn)">
+      TCP has no job codes for store
+      {{ $stores->firstWhere('id', $storeId)?->store_number ?? $storeId }} — the positions
+      above are the roles it uses elsewhere, and hours worked against them cannot reach
+      the timeclock yet.
+    </p>
+  @endunless
 </div>
 
 {{-- ── timeline ──────────────────────────────────────────────────────── --}}
@@ -349,7 +376,18 @@
               <label class="f"><span class="lbl">Position</span>
                 <select name="position_id">
                   <option value="">—</option>
-                  @foreach ($positions as $p)
+                  {{-- THE SHIFT'S OWN ROLE STAYS ON THE LIST even when TCP has no
+                       code for it. Filtering it out would preselect whatever
+                       happened to be first, so saving a time change would
+                       silently re-file the shift under a role nobody rostered —
+                       a worse fault than the one the filter is here to prevent.
+                       Flagged rather than hidden, so the dead end is visible. --}}
+                  @if ($s->position && ! $filable->contains('id', $s->position_id))
+                    <option value="{{ $s->position_id }}" selected>
+                      {{ $s->position->label }} — no TCP job code
+                    </option>
+                  @endif
+                  @foreach ($filable as $p)
                     <option value="{{ $p->id }}" @selected($p->id === $s->position_id)>{{ $p->label }}</option>
                   @endforeach
                 </select>

@@ -41,8 +41,10 @@ class PushWorkSegmentToTcp implements ShouldQueue
     {
         // withTrashed: a segment deleted locally still has to be removed from
         // TCP, and the delete path dispatches this job too.
+        // store and position come along because the job code is built from
+        // both — see TcpWorkSegmentWriter::wireBody().
         $segment = WorkSegment::withTrashed()
-            ->with('employee')
+            ->with(['employee', 'store', 'position'])
             ->find($this->workSegmentId);
 
         if ($segment === null) {

@@ -1,6 +1,7 @@
 <?php
 
 use App\Models\Employee;
+use App\Models\Position;
 use App\Models\WorkSegment;
 use App\Services\Scheduling\LaborCostEstimator;
 use App\Services\Scheduling\WorkSegmentSyncService;
@@ -204,6 +205,10 @@ it('records hours by hand as an unapproved manual_create, queued for TCP', funct
     $this->post('/board/segments', [
         'store_id' => DemoSeeder::STORE_ID,
         'employee_id' => $employee->id,
+        // REQUIRED since the TCP job code became mandatory: the code says which
+        // ROLE was worked, and TCP refuses a punch without one. A punch saved
+        // with no position could never reach the timeclock.
+        'position_id' => Position::query()->value('id'),
         'date' => $this->today,
         'time_in' => '09:00',
         'time_out' => '12:30',
@@ -232,6 +237,10 @@ it('records somebody still in the store when the clock-out is left empty', funct
     $this->post('/board/segments', [
         'store_id' => DemoSeeder::STORE_ID,
         'employee_id' => $employee->id,
+        // REQUIRED since the TCP job code became mandatory: the code says which
+        // ROLE was worked, and TCP refuses a punch without one. A punch saved
+        // with no position could never reach the timeclock.
+        'position_id' => Position::query()->value('id'),
         'date' => $this->today,
         'time_in' => '17:00',
     ])->assertRedirect()->assertSessionHas('ok');
@@ -252,6 +261,10 @@ it('rolls a hand-entered punch past midnight rather than refusing it', function 
     $this->post('/board/segments', [
         'store_id' => DemoSeeder::STORE_ID,
         'employee_id' => $employee->id,
+        // REQUIRED since the TCP job code became mandatory: the code says which
+        // ROLE was worked, and TCP refuses a punch without one. A punch saved
+        // with no position could never reach the timeclock.
+        'position_id' => Position::query()->value('id'),
         'date' => $this->today,
         'time_in' => '21:00',
         'time_out' => '01:00',
@@ -274,6 +287,10 @@ it('refuses a hand-entered punch whose clocks are identical', function () {
     $this->post('/board/segments', [
         'store_id' => DemoSeeder::STORE_ID,
         'employee_id' => $employee->id,
+        // REQUIRED since the TCP job code became mandatory: the code says which
+        // ROLE was worked, and TCP refuses a punch without one. A punch saved
+        // with no position could never reach the timeclock.
+        'position_id' => Position::query()->value('id'),
         'date' => $this->today,
         'time_in' => '17:00',
         'time_out' => '17:00',

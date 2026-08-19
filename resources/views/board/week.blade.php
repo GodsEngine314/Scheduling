@@ -22,12 +22,66 @@
     $planned = $showPlanned;
     $both = $showPlanned && $showActual;
 
+    // ── what the position dropdowns offer ─────────────────────────────────
+    // ONLY ROLES TCP HAS A JOB CODE FOR. Driver, Insider and Shift Lead are in
+    // the positions table and in no TCP code anywhere, so every shift or punch
+    // filed against one is hours the timeclock will refuse — visible here,
+    // invisible to payroll. The controller decides the set; see
+    // TcpJobCodeRole::positionIdsOfferableAt().
+    //
+    // The full table only on a fresh environment with nothing seeded, where the
+    // alternative is a form that offers nothing at all.
+    $filable = $offerablePositionIds === []
+        ? $positions
+        : $positions->whereIn('id', $offerablePositionIds);
+
+    // TCP has no codes for THIS store, so the list above is the estate's roles
+    // rather than this store's. Said out loud on the forms: a dropdown with
+    // options in it implies those options work, and here none of them do yet.
+    $storeInTcp = $pushablePositionIds !== [];
+
     // Cells are addressed by "employee id or the string open" + date, which is
     // exactly what the drop handler posts back.
     $cell = fn ($employeeId, string $day) => data_get($byCell, [(string) $employeeId, $day], collect());
     // The actual side has no open row: a punch is somebody clocking in, so
     // there is always a person behind it.
     $segCell = fn ($employeeId, string $day) => data_get($segsByCell, [(string) $employeeId, $day], collect());
+
+    // ── the sales column ──────────────────────────────────────────────────
+    // 12-hour labels because that is how a store talks about its own day. The
+    // 24-hour numbers underneath are the warehouse's, and nobody rostering an
+    // evening shift thinks in them.
+    $hourLabel = fn (int $h): string => match (true) {
+        $h === 0 => '12 AM',
+        $h === 12 => '12 PM',
+        $h < 12 => $h.' AM',
+        default => ($h - 12).' PM',
+    };
+
+    // The window read as a span, so the heading says 10 AM–12 AM rather than
+    // 10 AM–11 PM. Midnight is where the window ENDS; the 11 PM row is the last
+    // hour inside it, and labelling the span by its last bucket would lose the
+    // hour that bucket covers.
+    $windowLabel = function (array $hours) use ($hourLabel): string {
+        if ($hours === []) {
+            return '';
+        }
+
+        return $hourLabel($hours[0]).'–'.$hourLabel((int) (($hours[count($hours) - 1] + 1) % 24));
+    };
+
+    // Whole dollars in the per-hour rows. Fourteen of them stacked in a column
+    // this narrow, and the cents are noise in front of the only question the
+    // column is asked: which hours are the big ones.
+    $dollars = fn (float $v): string => '$'.number_format($v, 0);
+
+    // ── the hour row ──────────────────────────────────────────────────────
+    // Money and people are ONE row, read hour by hour, because neither says much
+    // without the other. It draws for either: the sales half can be unavailable,
+    // the headcount half is counted from the grid's own shifts and punches and
+    // never is. A week with neither — an empty rota with the integration off —
+    // draws no row rather than fourteen lines of zeroes.
+    $hourRow = $sales['available'] || $heads['peak'] > 0;
 
     $tab = fn (string $v): string => route('board.week', [
         'store' => $storeId, 'week' => $weekStart, 'view' => $v,
@@ -220,10 +274,19 @@
           @endforeach
         </select>
       </label>
+      {{-- No "none" here, unlike the planned-shift form below. TCP requires a
+           jobCodeId on every punch and the code encodes the ROLE, so hours
+           saved without a position can never reach the timeclock — they would
+           sit on this board looking recorded while payroll never saw them. --}}
+      {{-- ONLY WHAT THIS STORE CAN FILE. Driver, Insider and Shift Lead have
+           no TCP job code anywhere, and Management has one at a single store,
+           so offering the full list produced punches that saved cleanly, showed
+           on the board and could never be pushed. --}}
       <label class="f"><span class="lbl">Position</span>
-        <select name="position_id">
-          <option value="">— none —</option>
-          @foreach ($positions as $p)<option value="{{ $p->id }}">{{ $p->label }}</option>@endforeach
+        <select name="position_id" required>
+          @foreach ($filable as $p)
+            <option value="{{ $p->id }}">{{ $p->label }}</option>
+          @endforeach
         </select>
       </label>
       <label class="f"><span class="lbl">Clocked in</span><input type="time" name="time_in" value="17:00" required></label>
@@ -236,6 +299,17 @@
       It is created here first and pushed to TCP by a queued job, so a TCP outage
       leaves visible hours rather than losing them — and it arrives unapproved.
     </p>
+    @unless ($storeInTcp)
+      {{-- The positions above are the ESTATE's roles, not this store's — TCP has
+           no job codes for it, so the hours will record and then sit unpushed
+           with the reason on the chip. Better said here than discovered there. --}}
+      <p class="note" style="margin-top:6px;color:var(--warn)">
+        TCP has no job codes for store
+        {{ $stores->firstWhere('id', $storeId)?->store_number ?? $storeId }}, so these are
+        the roles it uses elsewhere. Hours recorded here save and show on the board,
+        but nothing can be filed at the timeclock until the store is mapped.
+      </p>
+    @endunless
   </div>
 @endif
 
@@ -261,9 +335,14 @@
           @endforeach
         </select>
       </label>
+      {{-- FILTERED THE SAME WAY THE HOURS FORM IS, which it did not used to be.
+           A plan goes to Humanity and needs no job code, so the full table was
+           defensible here in isolation — but rostering a Driver books a shift
+           whose hours TCP will refuse the moment somebody works it, and that
+           refusal surfaces at payroll rather than on this screen. --}}
       <label class="f"><span class="lbl">Position</span>
         <select name="position_id">
-          @foreach ($positions as $p)<option value="{{ $p->id }}">{{ $p->label }}</option>@endforeach
+          @foreach ($filable as $p)<option value="{{ $p->id }}">{{ $p->label }}</option>@endforeach
         </select>
       </label>
       <label class="f"><span class="lbl">Start</span><input type="time" name="start" value="17:00" required></label>
@@ -282,6 +361,16 @@
   <div class="lbl" style="margin-bottom:8px">The week ·
     {{ $both ? 'planned above, actual below' : ($actual ? 'actual hours' : 'planned shifts') }}</div>
 
+  {{-- Said out loud rather than left as a missing figure. A number that is
+       simply absent reads as "this store has no sales", which is a different and
+       much more alarming statement than "the warehouse did not answer". The
+       heads in that row are unaffected: they are counted here, from the shifts
+       and punches on this grid, so they are still on screen. --}}
+  @if (! $sales['available'] && $sales['message'] !== null)
+    <p class="note" style="margin:0 0 8px">Hourly sales are off the grid: {{ $sales['message'] }}
+      The heads-per-hour numbers are counted here rather than read, so they stay.</p>
+  @endif
+
   <table class="week">
     <thead>
       <tr>
@@ -295,6 +384,214 @@
       </tr>
     </thead>
     <tbody>
+      {{-- ── the hour row: what the store took, and who was in it ───────────
+           ABOVE THE PEOPLE, not beside them. This row is the demand the rows
+           below are staffed against, and it reads as a heading for the column
+           rather than as one more thing in it.
+
+           TWO NUMBERS PER HOUR, and they answer each other. The money is read
+           live from LC_PIZZA_DATA — royalty_obligation, the figure that system
+           reports against, so the column agrees with the DSPR a manager already
+           knows rather than being a second, subtly different total. The
+           headcount beside it is ours, counted from the very shifts and punches
+           drawn below. Neither is worth much alone: $600 at 5PM is right with
+           four people on and a disaster with one, and four people on is right or
+           wrong depending on what 5PM took.
+
+           The MONEY disappears when the warehouse cannot be reached — see
+           HourlySalesReader. The HEADS do not: they cost no request and cannot
+           fail, so the row keeps its coverage numbers through an outage that
+           used to take the whole thing off the grid. What is left is a week with
+           neither figure — an empty rota with the integration off — and that
+           draws no row at all rather than fourteen lines of zeroes. --}}
+      @if ($hourRow)
+        <tr class="wk-sales">
+          <td class="wk-name">
+            <div class="n">
+              {{ $sales['available'] ? 'Sales · heads' : 'Heads' }}
+              @if ($sales['stubbed'] ?? false)
+                {{-- INVENTED FIGURES, SAID ON THE GRID ITSELF. LC_DATA_STUB
+                     draws the money in this column from a local generator so the
+                     feature can be worked on without standing up the whole
+                     warehouse, and without this badge a screenshot of made-up
+                     revenue is indistinguishable from the real thing. The
+                     headcount is never generated — it is counted from this
+                     store's own rota either way. --}}
+                <span class="chip crit" title="LC_DATA_STUB is on: the sales figures are generated locally and are not real. The headcount is real — it is counted from the shifts and punches on this grid.">SAMPLE</span>
+              @endif
+            </div>
+            <div class="d">
+              {{ $windowLabel($sales['hours']) }}{{ $sales['available'] ? ' · royalty obligation' : '' }}<br>
+              {{-- Which number is which, said once at the head of the row rather
+                   than fourteen times inside a column this narrow. The colours
+                   are the grid's own: purple is the plan everywhere on this page,
+                   green is what TCP recorded. --}}
+              <span style="color:var(--text-3)">
+                heads:
+                @if ($planned)<span style="color:var(--planned)">planned</span>@endif
+                @if ($both)<span style="color:var(--text-3)">/</span>@endif
+                @if ($actual)<span style="color:var(--actual)">clocked in</span>@endif
+              </span>
+              @if ($sales['available'])
+                <br>
+                <span style="color:var(--text-3)">
+                  {{ ($sales['stubbed'] ?? false) ? 'sales generated locally — not real data' : 'sales live from LC_PIZZA_DATA' }}
+                </span>
+              @endif
+            </div>
+          </td>
+          @foreach ($days as $d)
+            @php
+                $day = $sales['days'][$d] ?? null;
+                $head = $heads['days'][$d] ?? null;
+            @endphp
+            <td class="wk-sales-cell">
+              @if ($day === null && $head === null)
+                <div class="sales-empty">—</div>
+              @else
+                <ol class="sales-hours">
+                  @foreach ($sales['hours'] as $h)
+                    @php
+                        // Null, not zero, when the warehouse said nothing at all:
+                        // "no figure" and "took nothing" are different claims and
+                        // only one of them may be printed as $0.
+                        $amount = $day === null ? null : (float) ($day['by_hour'][$h] ?? 0);
+                        // Against the busiest hour ON SCREEN. The bar answers
+                        // "which hours are the big ones" at a glance, which is
+                        // the question a rota is actually built around; the
+                        // number answers "how big".
+                        $share = ($amount !== null && $day['peak'] > 0) ? ($amount / $day['peak']) * 100 : 0;
+
+                        $plannedHeads = (int) ($head['planned'][$h] ?? 0);
+                        $openHeads = (int) ($head['open'][$h] ?? 0);
+                        $actualHeads = (int) ($head['actual'][$h] ?? 0);
+                        // Worked minus planned, for THIS hour. The week header
+                        // makes this comparison in hours; here it is in people,
+                        // which is the form a shortfall is actually fixed in.
+                        $gap = $actualHeads - $plannedHeads;
+                        // ...and only for an hour that has BEEN. "Two planned,
+                        // nobody in" is a hole on Monday and an ordinary Friday
+                        // evening that has not started; the numbers are
+                        // identical and only the clock tells them apart. Marking
+                        // both would paint half of every forward rota amber,
+                        // which is how a warning colour stops being read.
+                        $elapsed = $d < $heads['today']
+                            || ($d === $heads['today'] && $h < $heads['now_hour']);
+
+                        $tip = [$hourLabel($h).'–'.$hourLabel(($h + 1) % 24)];
+                        if ($amount !== null) {
+                            $tip[] = '$'.number_format($amount, 2);
+                        }
+                        if ($planned) {
+                            $tip[] = $plannedHeads.' planned in'
+                                .($openHeads > 0 ? ' · +'.$openHeads.' unfilled shift'.($openHeads === 1 ? '' : 's') : '');
+                        }
+                        if ($actual) {
+                            $tip[] = $actualHeads.' clocked in';
+                        }
+                        if ($both && $gap !== 0 && $elapsed) {
+                            $tip[] = abs($gap).($gap < 0 ? ' short of plan' : ' more than planned');
+                        }
+                    @endphp
+                    <li class="{{ $amount !== null && $amount > 0 && $amount >= $day['peak'] ? 'peak' : '' }} {{ $amount !== null && $amount <= 0 ? 'zero' : '' }}"
+                        style="--share:{{ round($share, 1) }}%"
+                        title="{{ implode(' · ', $tip) }}">
+                      <span class="h">{{ $hourLabel($h) }}</span>
+                      {{-- BETWEEN the hour and the money, and pushed up against
+                           the money rather than centred: the dollars stay flush
+                           right so fourteen of them read as a column, and the
+                           heads sit where the eye already is when it reads one. --}}
+                      <span class="hc {{ $both && $gap < 0 && $elapsed ? 'short' : '' }}">
+                        @if ($planned)<b class="p {{ $plannedHeads === 0 ? 'none' : '' }}">{{ $plannedHeads }}</b>@if ($openHeads > 0)<i class="o">+{{ $openHeads }}</i>@endif @endif
+                        @if ($both)<span class="sep">/</span>@endif
+                        @if ($actual)<b class="a {{ $actualHeads === 0 ? 'none' : '' }}">{{ $actualHeads }}</b>@endif
+                      </span>
+                      @if ($amount !== null)
+                        <span class="v">{{ $dollars($amount) }}</span>
+                      @endif
+                    </li>
+                  @endforeach
+                </ol>
+                @if ($day !== null)
+                  <div class="sales-sum">
+                    <span class="h">{{ $windowLabel($sales['hours']) }}</span>
+                    <span class="v">${{ number_format((float) $day['window_total'], 2) }}</span>
+                  </div>
+                  @php $outside = round((float) $day['day_total'] - (float) $day['window_total'], 2); @endphp
+                  @if (abs($outside) >= 0.01)
+                    {{-- Money taken outside the displayed hours. Shown rather
+                         than folded in, or the column would not add up to the
+                         day's real total and nobody could tell why. --}}
+                    <div class="sales-outside" title="Taken outside {{ $windowLabel($sales['hours']) }} — the day's full total is ${{ number_format((float) $day['day_total'], 2) }}">
+                      +${{ number_format($outside, 2) }} outside
+                    </div>
+                  @endif
+                @endif
+                @if ($head !== null)
+                  {{-- THE DAY'S BUSIEST HOUR BY PEOPLE, not a total. Headcount
+                       does not add up a column: somebody on from 10 until 6 is
+                       one person, not eight. The peak is the figure a rota is
+                       argued about — how many were in here at once. --}}
+                  <div class="heads-sum" title="The most people in the store at once on this day — the fullest single hour, not a total.">
+                    <span class="h">most on</span>
+                    <span class="v">
+                      @if ($planned)<b class="p">{{ $head['planned_peak'] }}</b>@endif
+                      @if ($both)<span class="sep">/</span>@endif
+                      @if ($actual)<b class="a">{{ $head['actual_peak'] }}</b>@endif
+                    </span>
+                  </div>
+                  @if ($actual && $head['unknown_out'] > 0)
+                    {{-- SAID, NOT SWALLOWED. A punch nobody closed has no end to
+                         count to, so only its clock-in hour is counted and every
+                         hour after it on this day is under-stated. Inventing an
+                         end would invent coverage; leaving the shortfall silent
+                         would be worse than either. --}}
+                    <div class="heads-note warn"
+                         title="{{ $head['unknown_out'] }} punch(es) on this day were never clocked out. Only the hour they clocked in is counted, so the hours after it show fewer people than were really here. Correct the times to fix the count.">
+                      ⚠ {{ $head['unknown_out'] }} missed clock-out
+                    </div>
+                  @endif
+                  @if ($actual && $head['still_in'] > 0)
+                    <div class="heads-note"
+                         title="{{ $head['still_in'] }} person/people are clocked in and have not clocked out. They are counted from their clock-in up to now and no further — the rest of their shift has not happened yet.">
+                      {{ $head['still_in'] }} still in · to now
+                    </div>
+                  @endif
+                @endif
+              @endif
+            </td>
+          @endforeach
+          <td class="wk-total">
+            @if ($sales['available'])
+              @php
+                  $weekWindow = collect($sales['days'])->sum(fn (array $day): float => (float) $day['window_total']);
+                  $weekDay = collect($sales['days'])->sum(fn (array $day): float => (float) $day['day_total']);
+              @endphp
+              <div class="n">${{ number_format($weekWindow, 2) }}</div>
+              {{-- .d is a wrapping flex row everywhere else on this grid; stacked
+                   here because these two are one figure and its qualifier, not
+                   two chips. --}}
+              <div class="d" style="flex-direction:column;gap:1px">
+                <span>{{ $windowLabel($sales['hours']) }}</span>
+                @if (abs($weekDay - $weekWindow) >= 0.01)
+                  <span>${{ number_format($weekDay, 2) }} all day</span>
+                @endif
+              </div>
+            @endif
+            {{-- The week's fullest hour, and deliberately not a sum. Seven days
+                 of "three on at 5PM" is the same three people seven times. --}}
+            <div class="n" style="{{ $sales['available'] ? 'margin-top:6px' : '' }}">
+              @if ($planned)<span style="color:var(--planned)">{{ $heads['planned_peak'] }}</span>@endif
+              @if ($both)<span style="color:var(--text-3);font-weight:400">/</span>@endif
+              @if ($actual)<span style="color:var(--actual)">{{ $heads['actual_peak'] }}</span>@endif
+            </div>
+            <div class="d" style="flex-direction:column;gap:1px">
+              <span>most on at once, any hour</span>
+            </div>
+          </td>
+        </tr>
+      @endif
+
       @foreach ($rows as $r)
         @php
             $e = $r['model'];
@@ -414,6 +711,36 @@
       <span>⚠ no planned shift behind the hours</span>
     @endif
   </div>
+  @if ($hourRow)
+    {{-- How to read "3/2". Said here rather than in the row itself, which has no
+         width for it, and worth saying at all because the two numbers look like
+         a fraction and are not one. --}}
+    <p class="note" style="margin-top:10px">
+      <strong>The top row is by the hour.</strong>
+      @if ($both)
+        <span style="color:var(--planned)">Planned</span> then
+        <span style="color:var(--actual)">clocked in</span> —
+        <code>3/2</code> is three people rostered into that hour and two who actually punched for it.
+        The second number turns amber when fewer turned up than were rostered.
+      @elseif ($planned)
+        The number by each hour is how many people are <span style="color:var(--planned)">planned</span>
+        to be in the store during it.
+      @else
+        The number by each hour is how many people were <span style="color:var(--actual)">clocked in</span>
+        during it.
+      @endif
+      @if ($planned)
+        A small <code>+1</code> is an <strong>unfilled shift</strong> covering that hour: counted apart from
+        the heads, because a shift with no name on it is a body still to find rather than one in the store.
+      @endif
+      Nobody is counted twice — somebody whose split shift touches 5PM twice is still one person at 5PM —
+      and the figure under each column is the day's <strong>fullest</strong> hour, not a total.
+      @if ($actual)
+        A punch nobody clocked out of can only be counted for the hour it started, so the hours after it
+        show fewer people than were really there; the day says so where it happens.
+      @endif
+    </p>
+  @endif
   @if ($actual)
     <p class="note" style="margin-top:10px">
       <strong>✓</strong> approves one person's hours and pushes the approval to TCP.
@@ -462,6 +789,21 @@
           <select name="reapprove" id="seg-reapprove">
             <option value="0">clear it — these hours need reviewing again</option>
             <option value="1">keep approved</option>
+          </select>
+        </label>
+      </div>
+
+      {{-- THE REPAIR PATH for a punch stuck against a role TCP has no code for.
+           Before this the dialog moved only the clocks, so the sole way out of
+           that state was to delete evidence of worked hours and retype them.
+           Listed the same way the entry form is: only what this store can
+           actually file. --}}
+      <div class="ctl" style="gap:10px">
+        <label class="f" style="min-width:220px"><span class="lbl">Position (what TCP files it as)</span>
+          <select name="position_id" id="seg-position">
+            @foreach ($filable as $p)
+              <option value="{{ $p->id }}">{{ $p->label }}</option>
+            @endforeach
           </select>
         </label>
       </div>
@@ -535,6 +877,13 @@
       reapprove.value = '0';
       // Nothing to keep on a punch that was never approved.
       reapprove.disabled = chip.dataset.approved !== '1';
+
+      // Preselected to what the punch already is, so saving a plain time
+      // correction cannot silently re-file it under a different role. A punch
+      // whose position is NOT offered — the stuck case — leaves the box on its
+      // first option, which is the point: it has to change to something valid.
+      const pos = document.getElementById('seg-position');
+      if (pos) { pos.value = chip.dataset.position || ''; }
 
       updateHint();
       dlg.showModal();

@@ -3,9 +3,11 @@
 namespace Database\Seeders;
 
 use App\Models\Position;
+use App\Models\TcpJobCode;
 use App\Models\TcpJobCodeRole;
 use App\Support\Integrations\Tcp\TcpClient;
 use Illuminate\Database\Seeder;
+use Illuminate\Support\Facades\DB;
 
 /**
  * TCP's job codes, reduced to the handful of ROLES behind them, so a punch can
@@ -68,6 +70,9 @@ class PositionSeeder extends Seeder
 
         // role suffix => ['label' => string, 'codes' => int]
         $roles = [];
+
+        // Every per-store code TCP has, for TcpJobCode.
+        $catalogue = [];
         $companyWide = 0;
         $conflicts = [];
 
@@ -81,6 +86,21 @@ class PositionSeeder extends Seeder
             }
 
             $suffix = $parts[3];
+
+            // THE CATALOGUE, gathered here rather than in a second pass over
+            // the same 237 records. Kept even when the label maps to no
+            // position of ours: a code TCP has is a fact, and the outbound
+            // lookup asks "does this code exist" before it asks what it means.
+            $catalogue[] = [
+                'job_code_id' => $jobCodeId,
+                'store_key' => $parts[1].$parts[2],
+                'role_suffix' => $suffix,
+                'description' => (string) ($code['description'] ?? ''),
+                'active' => (bool) ($code['active'] ?? true),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ];
+
             $label = $this->roleLabel((string) ($code['description'] ?? ''));
 
             if ($label === null) {
@@ -130,6 +150,23 @@ class PositionSeeder extends Seeder
                 ],
             );
         }
+
+        // REBUILT, NOT MERGED. A code retired at TCP has to disappear here, or
+        // the push path would keep offering something the vendor no longer
+        // accepts. Inside a transaction so a failed read never leaves the
+        // catalogue empty — an empty table means "never read" to the lookup,
+        // which would silently re-enable the blind synthesis this replaced.
+        DB::transaction(function () use ($catalogue): void {
+            TcpJobCode::query()->delete();
+
+            foreach (array_chunk($catalogue, 200) as $chunk) {
+                TcpJobCode::query()->insert($chunk);
+            }
+        });
+
+        $this->command?->info(
+            'PositionSeeder: '.count($catalogue).' per-store job codes catalogued.'
+        );
 
         $this->command?->info(
             'PositionSeeder: '.count($roles).' job code roles => '

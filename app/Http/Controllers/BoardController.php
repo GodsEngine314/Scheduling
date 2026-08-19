@@ -12,10 +12,13 @@ use App\Models\EmployeeRequest;
 use App\Models\Position;
 use App\Models\Shift;
 use App\Models\Store;
+use App\Models\TcpJobCodeRole;
 use App\Models\User;
 use App\Models\WorkSegment;
 use App\Services\Scheduling\BoardService;
 use App\Services\Scheduling\EmployeeRequestService;
+use App\Services\Scheduling\HourlyHeadcountCounter;
+use App\Services\Scheduling\HourlySalesReader;
 use App\Services\Scheduling\LaborCostEstimator;
 use App\Services\Scheduling\SchedulePublisher;
 use App\Services\Scheduling\ShiftService;
@@ -33,6 +36,7 @@ use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
 use Illuminate\View\View;
 use Throwable;
 
@@ -65,6 +69,8 @@ class BoardController extends Controller
         private readonly BusinessDay $businessDay,
         private readonly ActingUser $actingUser,
         private readonly StoreSettingService $settings,
+        private readonly HourlySalesReader $sales,
+        private readonly HourlyHeadcountCounter $heads,
     ) {}
 
     public function index(Request $request): View
@@ -110,6 +116,15 @@ class BoardController extends Controller
             'segments' => $segments,
             'conflicts' => $conflicts,
             'positions' => Position::query()->orderBy('id')->get(),
+            // The same rule the week view follows: dropdowns offer only roles
+            // TCP has a job code for, and the strict list rides along so the
+            // forms can say when a store has none. See the week() payload.
+            'offerablePositionIds' => TcpJobCodeRole::positionIdsOfferableAt(
+                $stores->firstWhere('id', $storeId)?->store_number,
+            ),
+            'pushablePositionIds' => TcpJobCodeRole::positionIdsPushableAt(
+                $stores->firstWhere('id', $storeId)?->store_number,
+            ),
             'roster' => $this->roster($storeId, $date),
             // What the publish button is about to send, so the count is on the
             // button rather than a surprise after pressing it.
@@ -411,6 +426,20 @@ class BoardController extends Controller
 
         $roster = $this->roster($storeId, $days->first());
 
+        /**
+         * WHAT THE STORE TOOK, and HOW MANY PEOPLE WERE IN IT TO TAKE IT. The
+         * two are one row on the grid and have to agree hour for hour, so the
+         * window is read once — from the sales reader, which owns it — and
+         * handed to the counter rather than looked up twice.
+         *
+         * The sales half can be unavailable; the headcount half never is. It is
+         * counted from the shifts and punches already fetched above, so it costs
+         * no query and cannot fail — which is why the hour row now survives the
+         * warehouse being down instead of disappearing with it.
+         */
+        $sales = $this->sales->forRange($storeId, $days->first(), $days->last());
+        $heads = $this->heads->forRange($storeId, $days->all(), $sales['hours'], $shifts, $segments);
+
         return view('board.week', [
             'stores' => $stores,
             'storeId' => $storeId,
@@ -442,10 +471,108 @@ class BoardController extends Controller
             // planning view has nothing to say about them.
             'rows' => $showActual ? $this->rowsForActual($roster, $segments, $days->first()) : $roster,
             'positions' => Position::query()->orderBy('id')->get(),
+            /**
+             * WHAT EVERY POSITION DROPDOWN ON THIS SCREEN OFFERS: only roles TCP
+             * has a job code for.
+             *
+             * Per store where TCP knows the store, so Management stays at the
+             * one store that carries it; the estate's roles where it does not,
+             * so the demo store gets a usable form rather than an empty select.
+             * See TcpJobCodeRole::positionIdsOfferableAt().
+             *
+             * THE PLANNED FORM IS FILTERED TOO, which it did not used to be. A
+             * plan goes to Humanity and needs no job code, so offering the full
+             * table was defensible in isolation — but Driver, Insider and Shift
+             * Lead exist in no TCP code anywhere, and every shift rostered
+             * against one is hours that cannot be filed when somebody works it.
+             * Better to not offer the role than to discover it at payroll.
+             */
+            'offerablePositionIds' => TcpJobCodeRole::positionIdsOfferableAt(
+                $stores->firstWhere('id', $storeId)?->store_number,
+            ),
+            /**
+             * The strict per-store list, kept ALONGSIDE the offerable one rather
+             * than folded into it, because [] is the one fact the dropdown
+             * cannot express: this store is not in TCP, so nothing on the list
+             * above can actually be filed from it. The forms say so out loud
+             * instead of implying otherwise by having options at all.
+             */
+            'pushablePositionIds' => TcpJobCodeRole::positionIdsPushableAt(
+                $stores->firstWhere('id', $storeId)?->store_number,
+            ),
             'costs' => $this->costs->estimateFor($shifts, $storeId, null),
             'actuals' => $this->costs->actualFor($segments, $storeId),
             'publishable' => $this->publisher->pendingInRange($storeId, $days->first(), $days->last())->count(),
             'timezone' => $this->businessDay->timezoneFor($storeId),
+            /**
+             * WHAT THE STORE WAS DOING WHILE THEY WORKED — read from
+             * LC_PIZZA_DATA, never stored here. Two people on at 11:00 is right
+             * or badly wrong depending on whether 11:00 is a $90 hour, and that
+             * number used to live in a system nobody had open while building a
+             * rota.
+             *
+             * It cannot fail the render: HourlySalesReader turns every failure
+             * into available => false and the grid drops the figures. See its
+             * docblock for why that is the normal case rather than the
+             * exceptional one.
+             */
+            'sales' => $sales,
+            /**
+             * HOW MANY PEOPLE WERE IN THE STORE IN EACH OF THOSE HOURS — the
+             * answer the sales figures on their own cannot give. $600 at 17:00
+             * is right with four on the floor and a disaster with one, and
+             * working out which meant counting chips down fourteen cells.
+             *
+             * Both sides of it, always, whichever tab is on screen: the planned
+             * tab shows who should be here, the actual tab who clocked in, and
+             * the combined tab both numbers against each other. See
+             * HourlyHeadcountCounter.
+             */
+            'heads' => $heads,
+        ]);
+    }
+
+    /**
+     * Refuse a position whose hours this store cannot file at TCP.
+     *
+     * Thrown as a VALIDATION error rather than an exception, so it lands back
+     * on the form beside the field that caused it instead of on an error page.
+     */
+    private function guardPushablePosition(int $storeId, int $positionId): void
+    {
+        $store = Store::query()->find($storeId);
+        $pushable = TcpJobCodeRole::positionIdsPushableAt($store?->store_number);
+
+        if (in_array($positionId, $pushable, true)) {
+            return;
+        }
+
+        // A STORE WITH NO JOB CODES AT ALL IS A DIFFERENT SITUATION, and
+        // collapsing the two was wrong. "You picked a role TCP does not have
+        // here" is a choice the manager can correct on the spot. "This store is
+        // not in TCP" is not about the position at all — refusing every option
+        // would make the store unable to record worked hours, which is a
+        // schedule problem invented to solve a timeclock one.
+        //
+        // So the hours are recorded and the push reports why it cannot go. The
+        // demo store is the obvious case; a real store missing from TCP is a
+        // misconfiguration that shows up on the chip rather than as a form that
+        // rejects everything.
+        if ($pushable === []) {
+            return;
+        }
+
+        $label = Position::query()->whereKey($positionId)->value('label') ?? 'That position';
+
+        $alternatives = Position::query()
+            ->whereIn('id', $pushable)
+            ->orderBy('id')
+            ->pluck('label')
+            ->implode(', ');
+
+        throw ValidationException::withMessages([
+            'position_id' => $label.' has no TCP job code at store '.($store?->store_number ?? $storeId)
+                .', so hours recorded against it could never reach the timeclock. Use one of: '.$alternatives.'.',
         ]);
     }
 
@@ -811,7 +938,13 @@ class BoardController extends Controller
         $data = $request->validate([
             'store_id' => ['required', 'integer', 'exists:stores,id'],
             'employee_id' => ['required', 'integer', 'exists:employees,id'],
-            'position_id' => ['nullable', 'integer', 'exists:positions,id'],
+            // REQUIRED, unlike everywhere else this column appears. TCP will
+            // not take hours without a jobCodeId and the code says which ROLE
+            // was worked, so a punch saved without a position is one that can
+            // never reach the timeclock — it sits on the board looking recorded
+            // while payroll never sees it. A punch PULLED from TCP always
+            // carries one; only this hand-entry path could omit it.
+            'position_id' => ['required', 'integer', 'exists:positions,id'],
             'date' => ['required', 'date_format:Y-m-d'],
             'time_in' => ['required', 'date_format:H:i'],
             // A clock-out BEFORE the clock-in is a punch that ran past midnight
@@ -820,6 +953,13 @@ class BoardController extends Controller
             'break_minutes' => ['nullable', 'integer', 'min:0', 'max:1440'],
             'notes' => ['nullable', 'string', 'max:2000'],
         ]);
+
+        // A DROPDOWN IS NOT A BOUNDARY. The form only offers positions this
+        // store can file, but a stale page or a hand-rolled POST can still
+        // carry one it cannot, and the result would be a punch that saves and
+        // then fails to sync forever. Refused here, while the manager is still
+        // looking at the form and can pick again.
+        $this->guardPushablePosition((int) $data['store_id'], (int) $data['position_id']);
 
         $outDate = ($data['time_out'] ?? null) !== null && $data['time_out'] < $data['time_in']
             ? now()->parse($data['date'])->addDay()->toDateString()
@@ -830,7 +970,7 @@ class BoardController extends Controller
         return $this->attempt($request, fn () => $this->segments->create([
             'store_id' => (int) $data['store_id'],
             'employee_id' => (int) $data['employee_id'],
-            'position_id' => $data['position_id'] ?? null,
+            'position_id' => (int) $data['position_id'],
             // _local, not the bare column: the form collects store wall clock,
             // and the service converts. Passing time_in here would read 09:30 as
             // UTC and file the punch at the store's offset.
@@ -857,6 +997,12 @@ class BoardController extends Controller
             'time_in' => ['required', 'date_format:H:i'],
             'time_out' => ['nullable', 'date_format:H:i'],
             'reapprove' => ['nullable', 'boolean'],
+            // THE REPAIR PATH. A punch recorded against a role TCP has no code
+            // for is stuck forever otherwise: the correction dialog only moved
+            // the clocks, so the only way out was to delete evidence of worked
+            // hours and retype it. Optional, so an ordinary time correction is
+            // unchanged.
+            'position_id' => ['nullable', 'integer', 'exists:positions,id'],
         ]);
 
         $outDate = ($data['time_out'] ?? null) !== null && $data['time_out'] <= $data['time_in']
@@ -865,6 +1011,16 @@ class BoardController extends Controller
 
         $reapprove = (bool) ($data['reapprove'] ?? false);
         $storeId = (int) $segment->store_id;
+
+        if (($data['position_id'] ?? null) !== null && (int) $data['position_id'] !== (int) $segment->position_id) {
+            $this->guardPushablePosition($storeId, (int) $data['position_id']);
+
+            // Written before correctTimes() so the queued push carries it. The
+            // column is scheduling's own, so saveQuietly leaves the sync state
+            // for correctTimes() to set.
+            $segment->forceFill(['position_id' => (int) $data['position_id']])->saveQuietly();
+            $segment->refresh();
+        }
 
         // correctTimes() takes UTC INSTANTS — a bare string is parsed as UTC,
         // not as store-local. The form collects wall-clock time, so it has to

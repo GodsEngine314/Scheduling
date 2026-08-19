@@ -60,6 +60,13 @@
 
     $tip[] = 'TCP '.($g->tcp_segment_id ? '#'.$g->tcp_segment_id : 'id not issued yet')
         .' · '.$g->tcp_sync_state?->label();
+
+    // WHY it failed, not just that it did. "failed" on its own sends somebody
+    // to the logs; the sentence beside it is usually enough to fix the punch
+    // from this screen — most often that its position has no TCP job code.
+    if ($g->tcp_sync_state === \App\Enums\TcpSyncState::Failed && $g->tcp_sync_error) {
+        $tip[] = \Illuminate\Support\Str::limit($g->tcp_sync_error, 220);
+    }
 @endphp
 <div class="chip-seg {{ $state }} {{ $approved ? 'is-approved' : '' }}"
      data-seg="{{ $g->id }}"
@@ -74,6 +81,9 @@
           paid hours a correction will produce, exactly as the service does. --}}
      data-break="{{ (int) $g->break_minutes }}"
      data-tcp="{{ $g->tcp_segment_id }}"
+     {{-- What TCP will file these hours as. The dialog preselects it so a plain
+          time correction cannot silently re-file the punch under another role. --}}
+     data-position="{{ $g->position_id }}"
      data-update-url="{{ route('board.segments.update', $g) }}"
      data-delete-url="{{ route('board.segments.destroy', $g) }}"
      title="{{ implode("\n", $tip) }}">

@@ -11,6 +11,11 @@
     --text:#1A1A22; --text-2:#585866; --text-3:#8A8A99;
     --planned:#6E63D2; --planned-soft:#E9E7FA; --planned-ink:#2E2870;
     --actual:#12876B; --actual-soft:#DDF1EB; --actual-ink:#0A4437;
+    /* A THIRD COLOUR, on purpose. Planned is purple and worked is green, and
+       both of those mean "a person". Sales are neither a plan nor a punch, so
+       borrowing either would say the wrong thing on a grid whose whole legend
+       is built on that distinction. */
+    --sales:#0F6FB8; --sales-soft:#DCEBF7; --sales-ink:#0A4470;
     --warn:#A96C08; --warn-soft:#FAEFD9; --crit:#AC3831; --crit-soft:#FAE7E5;
     --ok:#2C7A58; --ok-soft:#DDF1EB;
     --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
@@ -23,6 +28,7 @@
       --text:#E9E9F0; --text-2:#A2A2B1; --text-3:#73738A;
       --planned:#9A91F0; --planned-soft:#2A2560; --planned-ink:#D2CDFA;
       --actual:#3FBF9B; --actual-soft:#0D3D32; --actual-ink:#A2E5D0;
+      --sales:#4FA8E8; --sales-soft:#0C2E4A; --sales-ink:#B6DBF7;
       --warn:#E0A340; --warn-soft:#3A2B10; --crit:#E5766E; --crit-soft:#3C1B18;
       --ok:#4FC08D; --ok-soft:#0D3D32;
     }
@@ -123,6 +129,89 @@
   .wk-total .n{font-family:var(--mono);font-size:11.5px;font-weight:700;color:var(--text)}
   .wk-total .d{font-family:var(--mono);font-size:9.5px;color:var(--text-3);
     display:flex;flex-wrap:wrap;gap:3px;margin-top:2px}
+
+  /* ── hourly sales, the row above the people ──────────────────────────────
+     One list per day: the hour on the left, what the store took on the right,
+     and a bar behind each row scaled to the busiest hour on screen. The bar is
+     the part that gets read — "which hours are the big ones" is answered by
+     shape long before anybody reads a number — so it sits BEHIND the text
+     rather than beside it, and costs the column no width at all. */
+  tr.wk-sales td{border-bottom:2px solid var(--line-2);background:var(--surface-2)}
+  td.wk-sales-cell{vertical-align:top;padding:4px}
+  .sales-hours{list-style:none;margin:0;padding:0}
+  .sales-hours li{position:relative;display:flex;justify-content:space-between;gap:8px;
+    font-family:var(--mono);font-size:9.5px;line-height:1.5;padding:0 4px;
+    border-radius:3px;overflow:hidden;color:var(--sales-ink)}
+  /* --share is set per row by the view. width:0 renders as nothing, which is
+     the correct picture of an hour that took nothing.
+
+     THE ACCENT AT LOW OPACITY, not a pre-mixed soft tint. A tint mixed for a
+     white page is DARKER than the surface it sits on once the console goes
+     dark, so the bar reads as a hole rather than as a quantity — present in the
+     markup and invisible on screen. Opacity composites against whatever is
+     actually behind it and is right in both themes. */
+  .sales-hours li::before{content:"";position:absolute;left:0;top:0;bottom:0;
+    width:var(--share,0);background:var(--sales);opacity:.18;border-radius:3px}
+  .sales-hours li>*{position:relative}
+  .sales-hours li .h{color:var(--text-2);flex:0 0 auto}
+  .sales-hours li .v{font-weight:700;flex:0 0 auto}
+  /* The busiest hour of the day, named outright. The bar already makes it the
+     longest; this makes it the one you find without comparing. */
+  .sales-hours li.peak::before{opacity:.45}
+  .sales-hours li.peak .h,.sales-hours li.peak .v{color:var(--sales);font-weight:700}
+  /* An hour with no sales is still a row — a gap in the list would be read as
+     a gap in the data. Dimmed, so it is present without being loud. */
+  .sales-hours li.zero .h,.sales-hours li.zero .v{color:var(--text-3);font-weight:400}
+  /* Wrapping, and the value keeps its right edge on whichever line it lands on.
+     A store that took five figures in a day has a total wider than a 100px
+     column, and a nowrap flex row spills it over the top of the next day's. */
+  .sales-sum{display:flex;flex-wrap:wrap;justify-content:space-between;gap:0 8px;
+    margin-top:3px;padding:2px 4px 0;border-top:1px solid var(--line-2);
+    font-family:var(--mono);font-size:9.5px;color:var(--text-2)}
+  .sales-sum .v{font-weight:700;color:var(--text);margin-left:auto}
+  .sales-outside{font-family:var(--mono);font-size:9px;color:var(--text-3);padding:1px 4px}
+  .sales-empty{font-family:var(--mono);font-size:9.5px;color:var(--text-3);padding:2px 4px}
+
+  /* ── headcount, riding in the same rows as the money ─────────────────────
+     How many people were in the store in that hour, which is the question the
+     sales figure beside it cannot answer on its own.
+
+     NO LABELS, THE GRID'S OWN COLOURS INSTEAD. Purple is the plan on every other
+     part of this page and green is what TCP recorded, so "3/2" needs no legend
+     once it is those two colours — and a column fourteen rows deep has no width
+     for the words. The row's heading spells it out once; every hour carries it
+     in a tooltip.
+
+     Pushed right against the money rather than centred, so a headcount that
+     grows a digit cannot shove the dollars out of alignment. */
+  .sales-hours li .hc{margin-left:auto;flex:0 0 auto;display:inline-flex;align-items:baseline;gap:0}
+  .sales-hours li .hc .p{color:var(--planned)}
+  .sales-hours li .hc .a{color:var(--actual)}
+  .sales-hours li .hc .sep{color:var(--text-3);font-weight:400;padding:0 2px}
+  /* Nobody in the store that hour — dimmed rather than dropped, because an hour
+     with no cover is the most important number this row can show. */
+  .sales-hours li .hc b.none{color:var(--text-3);font-weight:400}
+  /* Unfilled shifts covering that hour. NOT added into the count: a shift with
+     no name on it is a body still to find, not one standing in the store. */
+  .sales-hours li .hc .o{font-style:normal;font-size:8.5px;color:var(--planned);opacity:.7;
+    padding-left:1px}
+  /* Fewer clocked in than planned, in the combined view only — the comparison
+     the header makes in hours, made here in people. */
+  .sales-hours li .hc.short .a{color:var(--warn)}
+
+  /* The day's fullest hour, under its column. Never a sum: somebody on from 10
+     until 6 is one person, not eight. */
+  .heads-sum{display:flex;justify-content:space-between;gap:8px;margin-top:2px;
+    padding:1px 4px 0;font-family:var(--mono);font-size:9.5px;color:var(--text-2)}
+  .heads-sum .p{color:var(--planned)}
+  .heads-sum .a{color:var(--actual)}
+  .heads-sum .sep{color:var(--text-3);font-weight:400;padding:0 2px}
+  /* WRAPPING, unlike every other cell on this grid. Table cells here are nowrap
+     so a chip cannot be broken across lines; a sentence in a 100px column has to
+     be, or it runs out over the next day and lands on top of its neighbour's. */
+  .heads-note{font-family:var(--mono);font-size:9px;color:var(--text-3);padding:1px 4px;
+    white-space:normal;line-height:1.35}
+  .heads-note.warn{color:var(--warn)}
 
   .topbar{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;justify-content:space-between}
   .topbar-nav{display:flex;gap:4px}

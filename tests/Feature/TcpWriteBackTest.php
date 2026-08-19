@@ -6,6 +6,7 @@ use App\Jobs\PushWorkSegmentToTcp;
 use App\Models\Employee;
 use App\Models\IntegrationIdentity;
 use App\Models\Shift;
+use App\Models\StoreSetting;
 use App\Models\WorkSegment;
 use App\Services\EventConsume\Handlers\EmployeeCreatedHandler;
 use App\Services\Scheduling\TcpEmployeeWriter;
@@ -245,6 +246,100 @@ it('sends timeOut even when it is null, so a mistaken clock-out can be reopened'
     // not happen, so timeOut is added after the filter on purpose.
     Http::assertSent(fn ($request) => array_key_exists('timeOut', $request->data())
         && $request->data()['timeOut'] === null);
+});
+
+// ── the store's clock, on the way out ────────────────────────────────────
+
+/*
+ * TCP KEEPS PUNCH TIMES ON THE STORE'S WALL, not in UTC. A live timeclock
+ * record settles it: timeIn "2026-08-17T17:59:00" beside createdOnDateTime
+ * "2026-08-17T21:59:00" is one instant written twice, once local and once UTC.
+ *
+ * Our columns are UTC, so an unconverted push filed every hand-entered punch —
+ * and every approval of a real one, since an approval PUTs the times back too —
+ * at the store's offset LATE inside TCP. It never showed on our own board,
+ * because the +00:00 we sent is honoured when we pull it back; only TCP and
+ * payroll saw the wrong hour, which is why this is asserted on the wire and not
+ * on the row.
+ */
+
+it('sends punch times as store-local wall clock, not UTC', function () {
+    Http::fake(['*' => Http::response(['id' => 'WS-TZ'], 200)]);
+
+    // Denver, so a wrong answer is six hours out rather than something that
+    // could pass for a rounding difference.
+    StoreSetting::where('store_id', DemoSeeder::STORE_ID)->update(['timezone' => 'America/Denver']);
+    BusinessDay::flushTimezoneCache();
+
+    $bd = app(BusinessDay::class);
+    $segment = WorkSegment::whereNotNull('time_out')->firstOrFail();
+    $segment->forceFill([
+        'tcp_segment_id' => 'WS-TZ',
+        'time_in' => $bd->combine(DemoSeeder::STORE_ID, '2026-08-18', '09:30:00'),
+        'time_out' => $bd->combine(DemoSeeder::STORE_ID, '2026-08-18', '17:45:00'),
+    ])->save();
+
+    app(TcpWorkSegmentWriter::class)->push($segment->fresh()->load(['employee', 'store', 'position']));
+
+    Http::assertSent(fn ($request) => $request->data()['timeIn'] === '2026-08-18T09:30:00'
+        && $request->data()['timeOut'] === '2026-08-18T17:45:00');
+});
+
+it('files a punch that ran past midnight on the local calendar, not the UTC one', function () {
+    Http::fake(['*' => Http::response(['id' => 'WS-TZ2'], 200)]);
+
+    StoreSetting::where('store_id', DemoSeeder::STORE_ID)->update(['timezone' => 'America/Chicago']);
+    BusinessDay::flushTimezoneCache();
+
+    $bd = app(BusinessDay::class);
+    $segment = WorkSegment::whereNotNull('time_out')->firstOrFail();
+    // 22:00 local is already the next UTC day, which is exactly the case an
+    // unconverted push turned into a punch starting at 03:00 tomorrow.
+    $segment->forceFill([
+        'tcp_segment_id' => 'WS-TZ2',
+        'time_in' => $bd->combine(DemoSeeder::STORE_ID, '2026-08-18', '22:00:00'),
+        'time_out' => $bd->combine(DemoSeeder::STORE_ID, '2026-08-19', '02:00:00'),
+    ])->save();
+
+    app(TcpWorkSegmentWriter::class)->push($segment->fresh()->load(['employee', 'store', 'position']));
+
+    Http::assertSent(fn ($request) => $request->data()['timeIn'] === '2026-08-18T22:00:00'
+        && $request->data()['timeOut'] === '2026-08-19T02:00:00');
+});
+
+it('round-trips a pushed punch through the reader without moving it', function () {
+    Http::fake(['*' => Http::response(['id' => 'WS-TZ3'], 200)]);
+
+    StoreSetting::where('store_id', DemoSeeder::STORE_ID)->update(['timezone' => 'America/Chicago']);
+    BusinessDay::flushTimezoneCache();
+
+    $bd = app(BusinessDay::class);
+    $timeIn = $bd->combine(DemoSeeder::STORE_ID, '2026-08-18', '11:15:00');
+
+    $segment = WorkSegment::whereNotNull('time_out')->firstOrFail();
+    $segment->forceFill(['tcp_segment_id' => 'WS-TZ3', 'time_in' => $timeIn])->save();
+
+    app(TcpWorkSegmentWriter::class)->push($segment->fresh()->load(['employee', 'store', 'position']));
+
+    $sent = null;
+    Http::assertSent(function ($request) use (&$sent) {
+        $sent = $request->data()['timeIn'];
+
+        return true;
+    });
+
+    // BARE, WITH NO OFFSET ON IT, which is the half of this the round trip
+    // cannot check on its own: WorkSegmentSyncService reads a value carrying an
+    // offset at face value, so a UTC push does survive our own pull — and looks
+    // right on the board while sitting in TCP at the wrong hour. Only the
+    // absence of the marker says the punch went out on TCP's own terms.
+    expect($sent)->toMatch('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/');
+
+    // And read the way the sync service reads a bare value — as the store's
+    // wall clock — it has to come back the instant we started with, or a punch
+    // walks by the store's offset every time it makes the round trip.
+    expect($bd->toUtc(DemoSeeder::STORE_ID, str_replace('T', ' ', $sent))->toDateTimeString())
+        ->toBe($timeIn->toDateTimeString());
 });
 
 // ── Humanity stays untouched until publish ──────────────────────────────

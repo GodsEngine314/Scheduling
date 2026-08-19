@@ -32,5 +32,17 @@
         <env name="PULSE_ENABLED" value="false"/>
         <env name="TELESCOPE_ENABLED" value="false"/>
         <env name="NIGHTWATCH_ENABLED" value="false"/>
+        <!-- The sales warehouse is a separate service and the suite must not
+             try to reach it. Off here, so a week-grid test that is about
+             dragging shifts does not spend its retry budget on a refused
+             connection to localhost. HourlySalesTest turns it back on and
+             fakes the HTTP itself. -->
+        <env name="LC_DATA_ENABLED" value="false"/>
+        <!-- Pinned so a developer's own .env cannot change what the suite
+             tests. LC_DATA_STUB is honoured in `testing` as well as `local`,
+             so leaving it unset let a machine with the stub switched on run
+             every warehouse test against generated figures instead of the
+             faked HTTP they were written for. -->
+        <env name="LC_DATA_STUB" value="false"/>
     </php>
 </phpunit>
