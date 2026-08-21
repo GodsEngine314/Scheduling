@@ -16,7 +16,7 @@ use Illuminate\Support\Facades\Http;
 |   MODE      where the token comes from — 'oauth' exchanges credentials for a
 |             short-lived one, 'static' takes it straight from the env.
 |   TRANSPORT how it rides on the request — an Authorization header, or a query
-|             parameter. Humanity's own examples use ?_token=.
+|             parameter, named access_token. Humanity's own examples use it.
 |
 | Only 'oauth' gets the 401-refresh repair in AbstractApiClient, so a static
 | token that expires fails every call until somebody edits the env.
@@ -87,22 +87,33 @@ it('sends a Humanity bearer token from the env without a token call', function (
     Http::assertNotSent(fn ($r) => str_contains($r->url(), 'oauth2/token'));
 });
 
-it('can carry a static Humanity token as the _token query parameter', function () {
+it('can carry a static Humanity token as the access_token query parameter', function () {
     config()->set('humanity.auth_mode', 'static');
     config()->set('humanity.static_token', 'humanity-secret');
     config()->set('humanity.auth_transport', '_token');
 
     Http::fake(['*' => Http::response(['id' => 'HS-1'], 200)]);
 
-    app(HumanityClient::class)->createShift(['start_time' => '2026-08-13 09:00:00']);
+    app(HumanityClient::class)->createShift(['start_time' => '9:00am']);
 
     // Mode and transport are independent: a token from the env can still ride
     // the way Humanity's own examples send it.
+    //
+    // THE PARAMETER IS access_token, and it was '_token' here because that was
+    // the guess the transport name was taken from. CONFIRMED: "Access token must
+    // be passed with the access_token query parameter or in Authorization header
+    // as Bearer token on every API request." A token under a name the vendor does
+    // not read is a 401 on a credential that is perfectly good — which is the
+    // worst kind of wrong, because it looks like the secret is bad.
+    //
+    // auth_transport keeps its '_token' spelling: it chooses query over header
+    // and is not the name of the parameter. token_query_param is.
     Http::assertSent(function ($r) {
         $query = [];
         parse_str((string) parse_url($r->url(), PHP_URL_QUERY), $query);
 
-        return ($query['_token'] ?? null) === 'humanity-secret';
+        return ($query['access_token'] ?? null) === 'humanity-secret'
+            && ! array_key_exists('_token', $query);
     });
 });
 

@@ -84,28 +84,31 @@
 
   @include('board._publish', [
       'storeId' => $storeId, 'from' => $date, 'to' => $date,
-      'publishable' => $publishable, 'label' => 'this day',
+      'publishable' => $publishable, 'republishable' => $republishable, 'range' => $range, 'label' => 'this day',
+  ])
+
+  {{-- The counterpart controls — see board/_range-actions.blade.php. On the day
+       board the range is the single day on screen. --}}
+  @include('board._range-actions', [
+      'storeId' => $storeId,
+      'from' => $date,
+      'to' => $date,
+      'label' => 'today',
+      'range' => $range,
   ])
 
   {{-- The other direction. Planned shifts go OUT to Humanity; worked hours come
        IN from TCP. Two buttons, two systems, no crossover. --}}
-  <div class="card pad grow" style="border-left:4px solid var(--actual)">
-    <div class="lbl">TCP</div>
-    <div style="font-family:var(--mono);font-weight:700;font-size:13px;color:var(--actual)">
-      Actual hours
-    </div>
-    <p class="note" style="margin:2px 0 8px">
-      Pulled with <code>GET /worksegments</code>, filtered to this store and date.
-      Re-pulling is free: the upsert is keyed on <code>tcp_segment_id</code>, and a
-      row a manager has already approved or corrected is held rather than overwritten.
-    </p>
-    <form method="POST" action="{{ route('board.pull-segments') }}" class="inline">
-      @csrf
-      <input type="hidden" name="store_id" value="{{ $storeId }}">
-      <input type="hidden" name="date" value="{{ $date }}">
-      <button class="primary">Pull actual hours from TCP</button>
-    </form>
-  </div>
+  {{-- The other direction. Planned shifts go OUT to Humanity; worked hours come
+       IN from TCP. There is no pull button any more — this day keeps itself
+       current. See board/_live.blade.php. --}}
+  @include('board._live', [
+      'storeId' => $storeId,
+      'from' => $date,
+      'to' => $date,
+      'live' => $live,
+      'headline' => $segments->count().' punch'.($segments->count() === 1 ? '' : 'es').' today',
+  ])
 
   {{-- Information, not a gate. There is no day or week close — this reports
        what is outstanding so it is visible, and nothing is blocked by it. --}}
@@ -132,17 +135,21 @@
     <input type="hidden" name="store_id" value="{{ $storeId }}">
     <input type="hidden" name="date" value="{{ $date }}">
     <label class="f"><span class="lbl">Employee</span>
-      <select name="employee_id">
+      <select name="employee_id" class="js-open-shift-toggle">
         <option value="">— open shift —</option>
-        @foreach ($roster as $r)
-          <option value="{{ $r['model']->id }}">{{ $r['model']->fullName() }}</option>
-        @endforeach
+        @include('board._employee-options')
       </select>
     </label>
-    {{-- Only roles TCP can file. A plan itself goes to Humanity, which has never
-         heard of a job code, but the hours somebody works against this shift go
-         to TCP — and a Driver shift produces hours it will refuse. --}}
-    <label class="f"><span class="lbl">Position</span>
+    {{-- THE OPEN-SLOT CASE ONLY. With a person on the shift the role is theirs
+         and comes from their profile — hiring's, then TCP's assignment — so this
+         field is hidden AND disabled, and the server ignores it either way. With
+         nobody on it there is nobody to read a role off, the position IS the
+         slot's whole content, and Humanity refuses a shift carrying none.
+
+         Still filtered to roles TCP can file: the plan goes to Humanity, which
+         has never heard of a job code, but the hours somebody works against this
+         shift go to TCP, and a Driver slot produces hours it will refuse. --}}
+    <label class="f js-open-shift-only"><span class="lbl">Position (open slot)</span>
       <select name="position_id">
         @foreach ($filable as $p)<option value="{{ $p->id }}">{{ $p->label }}</option>@endforeach
       </select>
@@ -161,14 +168,14 @@
     Availability is checked but never blocks the save.
   </p>
   @unless ($storeInTcp)
-    {{-- The roles on offer are the estate's, not this store's: TCP carries no job
-         codes for it, so hours worked against anything rostered here cannot be
-         filed until the store is mapped. --}}
+    {{-- Still true of the OPEN-SLOT picker, which is the one position field left:
+         its roles are the estate's, not this store's. And true of everybody on
+         the roster, none of whom can hold a code at a store TCP cannot name. --}}
     <p class="note" style="margin-top:6px;color:var(--warn)">
       TCP has no job codes for store
-      {{ $stores->firstWhere('id', $storeId)?->store_number ?? $storeId }} — the positions
-      above are the roles it uses elsewhere, and hours worked against them cannot reach
-      the timeclock yet.
+      {{ $stores->firstWhere('id', $storeId)?->store_number ?? $storeId }}, so nobody here
+      holds one and the open-slot roles are the ones it uses elsewhere. Shifts and hours
+      save either way; nothing reaches the timeclock until the store is mapped.
     </p>
   @endunless
 </div>
@@ -335,11 +342,13 @@
           </td>
           <td>
             @if ($s->publish_state?->isLocked())
-              {{-- Published and locked. Editing is refused until this is
-                   pressed; Humanity keeps the shift either way. --}}
-              <form method="POST" action="{{ route('board.shifts.unpublish', $s) }}" class="inline">
-                @csrf<button class="mini">unpublish to edit</button>
-              </form>
+              {{-- Published and locked, and there is no longer a button here to
+                   open it. Unpublishing is a range action now — one press for the
+                   day — because "unpublish, change it, republish" is not a
+                   per-shift workflow. Said rather than left as a dead cell. --}}
+              <span class="lbl" title="Published. Use &quot;Unpublish all&quot; above to unlock the day for editing.">
+                locked 🔒
+              </span>
             @else
               <button class="mini" type="button" onclick="document.getElementById('edit-shift-{{ $s->id }}').hidden = !document.getElementById('edit-shift-{{ $s->id }}').hidden">edit</button>
             @endif
@@ -368,30 +377,30 @@
               <label class="f"><span class="lbl">Employee</span>
                 <select name="employee_id">
                   <option value="">— open shift —</option>
-                  @foreach ($roster as $r)
-                    <option value="{{ $r['model']->id }}" @selected($r['model']->id === $s->employee_id)>{{ $r['model']->fullName() }}</option>
-                  @endforeach
+                  {{-- The same options the add form shows, from the same partial:
+                       one place decides how a role is worded and which source it
+                       came from. --}}
+                  @include('board._employee-options', ['selectedId' => $s->employee_id])
                 </select>
               </label>
-              <label class="f"><span class="lbl">Position</span>
-                <select name="position_id">
-                  <option value="">—</option>
-                  {{-- THE SHIFT'S OWN ROLE STAYS ON THE LIST even when TCP has no
-                       code for it. Filtering it out would preselect whatever
-                       happened to be first, so saving a time change would
-                       silently re-file the shift under a role nobody rostered —
-                       a worse fault than the one the filter is here to prevent.
-                       Flagged rather than hidden, so the dead end is visible. --}}
-                  @if ($s->position && ! $filable->contains('id', $s->position_id))
-                    <option value="{{ $s->position_id }}" selected>
-                      {{ $s->position->label }} — no TCP job code
-                    </option>
+              {{-- NO POSITION FIELD. Assigning somebody re-derives their role
+                   from TCP's own job code for them at this store, so an edit
+                   here cannot re-file a shift under a role nobody rostered —
+                   which is the exact fault the old, carefully-hedged dropdown
+                   existed to work around.
+
+                   The shift's CURRENT role is printed instead: still visible,
+                   just no longer editable by hand. An open slot's role is set
+                   when it is created and changes with the person who fills it. --}}
+              <div class="f">
+                <span class="lbl">Position</span>
+                <div style="font-family:var(--mono);font-size:12px;padding-top:5px">
+                  {{ $s->position?->label ?? '—' }}
+                  @if ($s->employee_id === null)
+                    <span class="lbl">open slot</span>
                   @endif
-                  @foreach ($filable as $p)
-                    <option value="{{ $p->id }}" @selected($p->id === $s->position_id)>{{ $p->label }}</option>
-                  @endforeach
-                </select>
-              </label>
+                </div>
+              </div>
               <label class="f"><span class="lbl">Start</span>
                 <input type="time" name="start" value="{{ str_replace('⁺', '', $hhmm($mins($s->start_at))) }}" required></label>
               <label class="f"><span class="lbl">End</span>
@@ -836,3 +845,34 @@
 </p>
 
 @endsection
+
+{{-- ── the open-slot position field ──────────────────────────────────────
+     Same rule as the week board: the only position picker left applies to a
+     shift with nobody on it. Assign a person and the role is theirs, from TCP.
+
+     The SERVER is the authority — storeShift() overrides position_id whenever an
+     employee is present. This only avoids showing a field whose value would be
+     ignored. --}}
+<script>
+(function () {
+  var picker = document.querySelector('.js-open-shift-toggle');
+  var field = document.querySelector('.js-open-shift-only');
+  if (!picker || !field) return;
+
+  var select = field.querySelector('select');
+
+  function sync() {
+    var open = picker.value === '';
+    field.style.display = open ? '' : 'none';
+    // DISABLED, NOT JUST HIDDEN. A select hidden with CSS still submits, so with
+    // a person chosen the form used to post a position nobody could see — and
+    // the server took it whenever the profile had no answer, quietly rostering
+    // them as whatever came first in the list. Disabled, it posts nothing and
+    // the shift's role can only come from the person.
+    if (select) { select.disabled = !open; }
+  }
+
+  picker.addEventListener('change', sync);
+  sync();
+})();
+</script>

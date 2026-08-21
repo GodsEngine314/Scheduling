@@ -115,6 +115,26 @@ class TokenProvider
         $this->log($integration, $endpoint, $response->status(), $startedAt, $correlationId);
 
         if (! $response->successful()) {
+            /**
+             * A REJECTED CREDENTIAL IS NOT A BAD REQUEST, and the difference is
+             * the whole message. This one travels all the way to
+             * shifts.last_publish_error and onto the board, where a manager
+             * reads it — so it has to say that the login was refused and that
+             * nothing was sent, rather than naming an HTTP status on a URL they
+             * have never heard of.
+             *
+             * 400 as well as 401/403: RFC 6749 has invalid_grant as a 400, and
+             * Humanity answers 401. Either way it is the same problem.
+             */
+            if (in_array($response->status(), [400, 401, 403], true)) {
+                throw IntegrationException::credentialsRejected(
+                    $integration,
+                    $endpoint,
+                    $response->status(),
+                    $correlationId,
+                );
+            }
+
             // No body excerpt: a token-endpoint error can quote the credentials
             // it just rejected.
             throw IntegrationException::fromResponse(
@@ -184,6 +204,10 @@ class TokenProvider
             'client_secret' => (string) $oauth['client_secret'],
             'username' => (string) ($oauth['username'] ?? ''),
             'password' => (string) ($oauth['password'] ?? ''),
+
+            // Listed among Humanity's token parameters and absent from TCP's.
+            // Sent only when configured, for the same reason as the two above.
+            'redirect_uri' => (string) ($oauth['redirect_uri'] ?? ''),
 
             // An empty scope means "send no scope", not "send scope=".
             'scope' => (string) ($oauth['scope'] ?? ''),

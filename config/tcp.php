@@ -100,4 +100,58 @@ return [
      * filter. Longer lists are chunked into several requests.
      */
     'filter_value_cap' => (int) env('TCP_FILTER_VALUE_CAP', 20),
+
+    /**
+     * KEEPING THE OPEN BOARD LIVE.
+     *
+     * There is no webhook and no subscription on this API — nothing in the
+     * vendor's surface can tell us a punch happened. "As soon as it appears in
+     * TCP" therefore has a floor, and the floor is how often we ask. These two
+     * numbers are that floor, and they compose: a punch shows up on a board
+     * within refresh_seconds + poll_seconds in the worst case.
+     *
+     * The work is driven by whoever is LOOKING at a board rather than by a
+     * blanket sweep, which is what makes a short interval affordable: one open
+     * week costs one request every refresh_seconds no matter how many managers
+     * and tabs are watching it, because the refresh is behind a lock. Stores
+     * nobody has open are covered by the estate-wide sweep in
+     * routes/console.php, at a much longer cadence.
+     */
+    'live' => [
+        // How stale the visible range may get before the next poll asks TCP
+        // again. Also the lock's practical period: extra pollers inside the
+        // window are answered from what the first one fetched.
+        'refresh_seconds' => (int) env('TCP_LIVE_REFRESH_SECONDS', 20),
+
+        // How often the browser asks us whether anything changed. Deliberately
+        // shorter than refresh_seconds: the poll is a cheap indexed count
+        // against our own database, and it is what makes a punch fetched by
+        // somebody else's poll appear on this screen promptly.
+        'poll_seconds' => (int) env('TCP_LIVE_POLL_SECONDS', 10),
+
+        // A tab left open overnight must not keep a store's sync warm until
+        // morning. After this long with no interaction the page stops polling
+        // and says so, and any click or keypress starts it again.
+        'idle_timeout_seconds' => (int) env('TCP_LIVE_IDLE_TIMEOUT_SECONDS', 1800),
+
+        // How long a refresh may run before the next poller is allowed to try
+        // again. Above the vendor's own timeout, so a slow call is waited out
+        // rather than raced.
+        'lock_seconds' => (int) env('TCP_LIVE_LOCK_SECONDS', 45),
+
+        /*
+         * The RENDER's threshold, deliberately far laxer than refresh_seconds.
+         *
+         * Rendering a board also reads the range, so that a grid's first paint
+         * is never an empty lie — but every approve and correction redirects
+         * back onto that render, and a person is sitting through the wait. On
+         * the heartbeat's own interval a manager working down a week of
+         * approvals would hit a vendor round trip every third click. Here they
+         * hit one on arrival and none after, while the heartbeat keeps the grid
+         * current in the background.
+         *
+         * A range with NO reading behind it is refreshed regardless of this.
+         */
+        'render_max_age_seconds' => (int) env('TCP_LIVE_RENDER_MAX_AGE_SECONDS', 300),
+    ],
 ];

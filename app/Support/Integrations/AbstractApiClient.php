@@ -46,9 +46,7 @@ abstract class AbstractApiClient
      */
     public const CORRELATION_HEADER = 'X-Correlation-Id';
 
-    public function __construct(protected readonly TokenProvider $tokens)
-    {
-    }
+    public function __construct(protected readonly TokenProvider $tokens) {}
 
     /** Config namespace and log label: 'tcp' or 'humanity'. */
     abstract protected function integration(): string;
@@ -75,6 +73,23 @@ abstract class AbstractApiClient
     protected function defaultHeaders(): array
     {
         return [];
+    }
+
+    /**
+     * How this vendor wants a request body encoded: 'json' or 'form'.
+     *
+     * JSON by default because TCP takes JSON, and because a wrong default that
+     * a vendor rejects outright is safer than one it accepts and misreads.
+     *
+     * Humanity overrides it. Its every endpoint is documented
+     * application/x-www-form-urlencoded, and the failure mode when this is wrong
+     * is nasty rather than obvious: the vendor answers 200 with a body that
+     * looks fine, having parsed NO parameters out of the JSON at all — so a
+     * create reports success and no shift exists.
+     */
+    protected function bodyFormat(): string
+    {
+        return 'json';
     }
 
     /**
@@ -108,11 +123,12 @@ abstract class AbstractApiClient
 
     /**
      * @param  array<string,mixed>  $query
+     * @param  array<mixed>  $body
      * @return array<mixed>
      */
-    protected function delete(string $path, array $query = []): array
+    protected function delete(string $path, array $query = [], array $body = []): array
     {
-        return $this->request('DELETE', $path, $query);
+        return $this->request('DELETE', $path, $query, $body === [] ? null : $body);
     }
 
     /**
@@ -152,6 +168,31 @@ abstract class AbstractApiClient
                     $correlationId,
                     $e,
                 );
+            } catch (IntegrationException $e) {
+                /**
+                 * THE TOKEN FETCH IS INSIDE send(), AND IT WAS NOT RETRYABLE.
+                 *
+                 * TokenProvider does its own HTTP and wraps a failure as an
+                 * IntegrationException, which is not a ConnectionException — so
+                 * it sailed straight past the catch above and out of this loop.
+                 * A DNS blip while fetching a token therefore failed the whole
+                 * publish on the first attempt, with retry.attempts sitting at 3
+                 * and never being spent. Observed twice against the live vendor:
+                 * "could not be reached", then the identical call succeeding
+                 * seconds later.
+                 *
+                 * isTransient() is what decides. A REJECTED CREDENTIAL is not
+                 * transient and must not be retried — repeating a bad login is
+                 * how an account gets locked — so credentialsRejected() rethrows
+                 * here immediately and only the reachability failures loop.
+                 */
+                if (! $e->isTransient() || $attempt >= $maxAttempts) {
+                    throw $e;
+                }
+
+                $this->backOff($attempt++);
+
+                continue;
             }
 
             $status = $response->status();
@@ -215,6 +256,10 @@ abstract class AbstractApiClient
             ->acceptJson()
             ->withHeaders($headers);
 
+        if ($this->bodyFormat() === 'form') {
+            $request = $request->asForm();
+        }
+
         if ($query !== []) {
             $request = $request->withQueryParameters($query);
         }
@@ -224,7 +269,10 @@ abstract class AbstractApiClient
             'POST' => $request->post($path, $body ?? []),
             'PUT' => $request->put($path, $body ?? []),
             'PATCH' => $request->patch($path, $body ?? []),
-            'DELETE' => $request->delete($path),
+            // A body on a DELETE, which is unusual and is what Humanity's
+            // documented `rule` parameter needs. Laravel omits it entirely when
+            // the array is empty, so this stays a bare DELETE for TCP.
+            'DELETE' => $request->delete($path, $body ?? []),
             default => throw IntegrationException::guard(
                 $this->integration(),
                 $this->endpoint($path),

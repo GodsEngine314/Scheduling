@@ -70,6 +70,8 @@ class WorkSegmentService
             ]);
         }
 
+        $this->refuseOverlap((int) $attributes['employee_id'], $storeId, $timeIn, $timeOut);
+
         $manualShiftId = $attributes['shift_id'] ?? null;
         $breakMinutes = (int) ($attributes['break_minutes'] ?? 0);
 
@@ -173,6 +175,17 @@ class WorkSegmentService
             ]);
         }
 
+        // A correction can walk a punch onto one of its neighbours just as easily
+        // as a hand-entered one can be placed there, so the same guard applies —
+        // excluding this segment, which of course overlaps itself.
+        $this->refuseOverlap(
+            (int) $segment->employee_id,
+            (int) $segment->store_id,
+            $newIn,
+            $newOut,
+            (int) $segment->id,
+        );
+
         return DB::transaction(function () use ($segment, $newIn, $newOut, $reapprove, $userId): WorkSegment {
             $storeId = (int) $segment->store_id;
             $breakMinutes = (int) $segment->break_minutes;
@@ -200,6 +213,120 @@ class WorkSegmentService
 
             return $segment;
         });
+    }
+
+    /**
+     * REFUSE a punch that would put one person in two places at once.
+     *
+     * BLOCKS, it does not warn, and that is the opposite of how ShiftService
+     * treats an overlapping SHIFT. The asymmetry is the point:
+     *
+     *   A shift is a PLAN. Double-booking somebody is sometimes what a manager
+     *       means — cover is being arranged, the person has agreed to it — so
+     *       ShiftService::conflicts() surfaces it and saves anyway.
+     *   A segment is a RECORD OF FACT. Nobody worked two overlapping stretches,
+     *       so an overlap is not a decision, it is a mistake — and it is one
+     *       that silently pays them twice, because the day close and the labour
+     *       cost both sum `hours` across segments.
+     *
+     * ONLY THE MANUAL PATHS. WorkSegmentSyncService writes its own rows straight
+     * through WorkSegment::create, deliberately bypassing this: TCP is the source
+     * of truth for punches, and if a real timeclock reports overlapping ones then
+     * that is what happened and refusing to store it would lose the evidence.
+     * This guards what a human types on the board.
+     *
+     * ACROSS STORES, NOT JUST THIS ONE. A person covering at another store still
+     * cannot be in both, and the estate does move people around — so the query
+     * is keyed on the employee alone and the store is named in the message.
+     *
+     * @throws SchedulingException
+     */
+    private function refuseOverlap(
+        int $employeeId,
+        int $storeId,
+        CarbonImmutable $timeIn,
+        ?CarbonImmutable $timeOut,
+        ?int $excludeSegmentId = null,
+    ): void {
+        // The store only decides which calendar day bounds the scan. The overlap
+        // test itself compares UTC instants, so a punch filed at another store
+        // under a different timezone is still caught.
+        $day = CarbonImmutable::parse($this->businessDay->businessDate($storeId, $timeIn));
+
+        $clash = WorkSegment::query()
+            ->where('employee_id', $employeeId)
+            ->when(
+                $excludeSegmentId !== null,
+                fn ($query) => $query->whereKeyNot($excludeSegmentId),
+            )
+            // A day either side keeps the (employee_id, business_date) index in
+            // play while still catching an overnight neighbour — the same bound
+            // ShiftService::overlapWarnings() uses.
+            ->whereBetween('business_date', [
+                $day->subDay()->toDateString(),
+                $day->addDay()->toDateString(),
+            ])
+            // AN OPEN PUNCH HAS NO END, so it is treated as running forever:
+            // somebody still clocked in cannot start a second punch, and that is
+            // the most common way this gets hit.
+            ->where(function ($query) use ($timeIn): void {
+                $query->whereNull('time_out')->orWhere('time_out', '>', $timeIn);
+            })
+            // A new OPEN punch runs forever too, so it clashes with anything that
+            // ends after it starts and there is no upper bound to apply.
+            ->when(
+                $timeOut !== null,
+                fn ($query) => $query->where('time_in', '<', $timeOut),
+            )
+            ->orderBy('time_in')
+            ->first();
+
+        if ($clash === null) {
+            return;
+        }
+
+        $storeId = $clash->store_id === null ? null : (int) $clash->store_id;
+        $local = fn (?CarbonInterface $at): string => $at === null
+            ? 'still in'
+            : $this->businessDay->toLocal($storeId, $at)->format('H:i');
+
+        $isDuplicate = $clash->time_in !== null
+            && $clash->time_in->equalTo($timeIn)
+            && (($clash->time_out === null && $timeOut === null)
+                || ($clash->time_out !== null && $timeOut !== null && $clash->time_out->equalTo($timeOut)));
+
+        throw new SchedulingException(
+            $isDuplicate
+                ? sprintf(
+                    'This is the same punch as work segment #%d — %s, %s to %s at store %s. It was not '
+                    .'created, because two identical punches would pay these hours twice.',
+                    $clash->id,
+                    $clash->business_date?->toDateString() ?? '?',
+                    $local($clash->time_in),
+                    $local($clash->time_out),
+                    $clash->store_id ?? '?',
+                )
+                : sprintf(
+                    'This punch overlaps work segment #%d — %s, %s to %s at store %s. It was not created, '
+                    .'because nobody can work two stretches at once and the day close would sum both. '
+                    .'%s',
+                    $clash->id,
+                    $clash->business_date?->toDateString() ?? '?',
+                    $local($clash->time_in),
+                    $local($clash->time_out),
+                    $clash->store_id ?? '?',
+                    $clash->time_out === null
+                        ? 'That punch is still open — clock it out first, then enter this one.'
+                        : 'Correct the existing punch instead, or delete it if it is wrong.',
+                ),
+            [
+                'employee_id' => $employeeId,
+                'work_segment_id' => $clash->id,
+                'time_in' => $timeIn->toIso8601String(),
+                'time_out' => $timeOut?->toIso8601String(),
+                'duplicate' => $isDuplicate,
+            ],
+        );
     }
 
     /** Soft delete. The hours stay recoverable; a punch is evidence. */

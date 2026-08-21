@@ -78,7 +78,8 @@
   td.wk-cell{vertical-align:top;height:74px;padding:4px;background:var(--sunken);
     border:1px solid var(--line);white-space:normal}
   td.wk-cell.over{background:var(--planned-soft);border-color:var(--planned);border-style:dashed}
-  .chip-shift{display:block;margin-bottom:3px;padding:3px 5px;border-radius:4px;cursor:grab;
+  /* position:relative anchors the delete button in the corner. */
+  .chip-shift{display:block;position:relative;margin-bottom:3px;padding:3px 5px;border-radius:4px;cursor:grab;
     background:var(--planned-soft);border:1px solid var(--planned);color:var(--planned-ink);
     font-family:var(--mono);font-size:9.5px;line-height:1.35}
   .chip-shift:active{cursor:grabbing}
@@ -89,6 +90,26 @@
     background:var(--ok-soft)}
   .chip-shift .t{display:block;font-weight:700}
   .chip-shift .m{display:block;color:var(--text-3)}
+
+  /* Delete, in the chip's top-right corner.
+     HIDDEN UNTIL HOVER, because a week grid is forty of these and a red × on
+     every one turns a schedule into a minefield. It is not hidden from the
+     keyboard: :focus-visible brings it back, so tabbing through the grid still
+     reaches it — and a pointer-less device (:hover:none) gets it permanently,
+     since there is no hover to reveal it with. */
+  .chip-del-form{position:absolute;top:0;right:0;line-height:0;margin:0}
+  .chip-del{opacity:0;transition:opacity .12s;cursor:pointer;
+    padding:0 3px;border:0;border-radius:0 4px 0 4px;background:var(--crit);color:#fff;
+    font-family:var(--mono);font-size:10px;font-weight:700;line-height:1.3}
+  /* The unlock is not destructive, so it is not red — and it stays visible on a
+     published chip rather than hiding until hover, because it is the ONLY thing
+     that chip will let you do. */
+  .chip-del.unlock{background:transparent;color:var(--planned-ink);opacity:.7;font-size:9px}
+  .chip-shift:hover .chip-del{opacity:.85}
+  .chip-shift:hover .chip-del.unlock{opacity:1}
+  .chip-del:hover{opacity:1}
+  .chip-del:focus-visible{opacity:1;outline:2px solid var(--text-1);outline-offset:1px}
+  @media (hover:none){.chip-del{opacity:.85}}
 
   /* the week grid, actual side. Green is signed off, amber is work waiting for
      somebody, and a dashed outline is a punch that has not finished happening. */
@@ -285,6 +306,10 @@
   .key{display:inline-block;width:16px;height:9px;border-radius:2px;margin-right:4px;
        vertical-align:middle}
 </style>
+{{-- Per-page CSS, pushed by partials that own a widget. Kept in one place so a
+     partial included on both boards contributes its styles exactly once — see
+     the @once in board/_live.blade.php. --}}
+@stack('styles')
 </head>
 <body>
 <div class="wrap">
@@ -347,5 +372,8 @@
   @endif
   @yield('content')
 </div>
+{{-- After the content, so a pushed script can assume the markup it drives is
+     already parsed and needs no DOMContentLoaded wrapper. --}}
+@stack('scripts')
 </body>
 </html>

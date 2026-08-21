@@ -7,8 +7,11 @@ use App\Enums\IntegrationSystem;
 use App\Enums\PublishState;
 use App\Exceptions\IntegrationException;
 use App\Exceptions\SchedulingException;
+use App\Models\HumanitySchedule;
 use App\Models\IntegrationIdentity;
 use App\Models\Shift;
+use App\Models\Store;
+use App\Models\TcpJobCodeRole;
 use App\Support\BusinessDay;
 use App\Support\Integrations\Humanity\HumanityClient;
 use Illuminate\Database\Eloquent\Builder;
@@ -57,6 +60,11 @@ class SchedulePublisher
         // is reported 'unchanged' instead of costing a pointless request.
         PublishState::Unlocked,
     ];
+
+    /** CONFIRMED: a shift's `type` is 0 Standard, 1 Open. */
+    private const TYPE_STANDARD = 0;
+
+    private const TYPE_OPEN = 1;
 
     /**
      * Per-run memo of "{entity_type}:{entity_id}" => Humanity id (or null).
@@ -217,7 +225,7 @@ class SchedulePublisher
     {
         try {
             $state = $this->desiredState($shift);
-            $response = $this->humanity->createShift($this->wireBody($state));
+            $response = $this->humanity->createShift($this->createBody($state));
             $humanityShiftId = $this->shiftIdFrom($response);
 
             if ($humanityShiftId === null) {
@@ -231,9 +239,26 @@ class SchedulePublisher
                 );
             }
 
-            // A brand new Humanity shift has nobody on it, so the delta is the
-            // whole desired roster and there is no current roster to read.
-            $this->applyStaffing($humanityShiftId, $state['staffing'], []);
+            // The create already carried employee_id, so in the normal case the
+            // shift lands staffed in one request and there is nothing to do
+            // here. This is the repair for when it does not: if the response
+            // reports a roster and somebody we asked for is missing from it,
+            // add them.
+            //
+            // SILENCE IS NOT AN EMPTY ROSTER. A response that says nothing about
+            // employees leaves this alone — the parameter is documented to
+            // assign them, and inventing a disagreement out of a field the
+            // vendor simply did not send would put a second request behind every
+            // single create.
+            $rostered = $this->humanity->staffingFrom($response);
+
+            if ($rostered !== null) {
+                $this->applyStaffing(
+                    $humanityShiftId,
+                    array_values(array_diff($state['staffing'], $rostered)),
+                    [],
+                );
+            }
 
             $this->recordSuccess($shift, $humanityShiftId, $this->fingerprint($state));
         } catch (Throwable $e) {
@@ -357,15 +382,26 @@ class SchedulePublisher
      * The complete desired state of this shift in Humanity, as ONE canonical
      * array.
      *
-     * The fingerprint is taken over this whole thing, staffing included, even
-     * though staffing does not travel in the request body: Humanity only
-     * honours employee_id alongside copy_to and silently ignores it otherwise
-     * (see HumanityClient::updateShiftStaffing), so a roster change is applied
-     * as an add/remove delta. It still has to void the fingerprint, or
-     * reassigning a shift would look like no change at all.
+     * THE FIELD NAMES AND FORMATS ARE CONFIRMED against
+     * platform.humanity.com/reference/post-shift, and what was here before was
+     * not merely differently spelled — it could not have worked:
      *
-     * GUESS: every field name here is inferred. The vendor's field tables are
-     * images that could not be read.
+     *   start_date / end_date  were MISSING. Humanity takes the date and the
+     *       time as four separate required fields, not two timestamps, so every
+     *       create was short two required parameters.
+     *   start_time / end_time  were 'Y-m-d H:i:s'. The documented format is
+     *       'g:ia' — "5:00pm".
+     *   schedule  is REQUIRED, and nothing populated the mapping it reads, so
+     *       wireBody()'s null filter quietly dropped it from every request.
+     *
+     * TWO DATES, NOT ONE, and that is what carries an overnight shift: a
+     * 21:00–01:00 block ends on the following calendar day, and end_date says so
+     * while business_date still files the shift under the day it started.
+     *
+     * The fingerprint is taken over this whole thing, staffing included, even
+     * though staffing travels differently on a create and an update. It still
+     * has to void the fingerprint, or reassigning a shift would look like no
+     * change at all.
      *
      * @return array<string, mixed>
      */
@@ -373,25 +409,164 @@ class SchedulePublisher
     {
         $storeId = (int) $shift->store_id;
 
+        // Store-local wall clock. Humanity schedules are per location and a
+        // location has one clock on the wall; sending UTC would show every
+        // shift at the wrong hour to the manager reading it.
+        $start = $this->businessDay->toLocal($storeId, $shift->start_at);
+        $end = $this->businessDay->toLocal($storeId, $shift->end_at);
+
+        $isOpen = $shift->employee_id === null;
+
         $state = [
-            // Store-local wall clock. Humanity schedules are per location and a
-            // location has one clock on the wall; sending UTC would show every
-            // shift at the wrong hour to the manager reading it.
-            'start_time' => $this->businessDay->toLocal($storeId, $shift->start_at)->format('Y-m-d H:i:s'),
-            'end_time' => $this->businessDay->toLocal($storeId, $shift->end_at)->format('Y-m-d H:i:s'),
+            'start_date' => $start->format('Y-m-d'),
+            'end_date' => $end->format('Y-m-d'),
+            // CONFIRMED format, and note it carries no seconds: Humanity's shift
+            // clock is minutes. A shift edited only below the minute therefore
+            // fingerprints the same and is reported unchanged, which is correct
+            // — there is nothing to send.
+            'start_time' => $start->format('g:ia'),
+            'end_time' => $end->format('g:ia'),
+            'schedule' => $this->scheduleFor($shift),
             'notes' => $shift->notes,
-            'location' => $this->externalId(IntegrationEntityType::Store, $storeId),
-            'schedule' => $shift->position_id === null
-                ? null
-                : $this->externalId(IntegrationEntityType::Position, (int) $shift->position_id),
+            // 0 Standard, 1 Open. An unassigned shift on our board is one nobody
+            // has been given yet, which is what Open means; publishing it as
+            // Standard-with-nobody-on-it hides it from the people who could take
+            // it.
+            'type' => $isOpen && (bool) config('humanity.publish_open_shifts_as_open', true)
+                ? self::TYPE_OPEN
+                : self::TYPE_STANDARD,
+            /**
+             * needed ONLY FOR AN OPEN SHIFT, and this is what a live GET /shifts
+             * corrected. Every real shift in this account reads:
+             *
+             *     type = 0    needed = 0    location = 0
+             *
+             * So a staffed standard shift carries needed 0, not 1 — `needed`
+             * counts slots to FILL, and a shift with its person on it has none.
+             * Sending 1 would have every published shift ask the store for one
+             * more body than it wants.
+             */
+            'needed' => $isOpen ? 1 : 0,
             'staffing' => $this->desiredStaffing($shift),
         ];
+
+        // Off by default: `location` is Humanity's REMOTE location override, and
+        // the shift's real location comes from its schedule. See
+        // config/humanity.php.
+        if ((bool) config('humanity.send_shift_location', false)) {
+            $state['location'] = $this->externalId(IntegrationEntityType::Store, $storeId);
+        }
 
         // Stable key order, so a fingerprint depends on the values and not on
         // the order this method happened to build them in.
         ksort($state);
 
         return $state;
+    }
+
+    /**
+     * The Humanity schedule this shift belongs to. REQUIRED on POST /shifts.
+     *
+     * Refused rather than omitted, and loudly, for the same reason the staffing
+     * guard below refuses: a shift Humanity rejects for a missing required field
+     * costs a round trip and reports a vendor error about a concept no manager
+     * has heard of, where this says which store and which position to go and fix.
+     *
+     * The two failures are told apart on purpose. An EMPTY catalogue is a setup
+     * step somebody has not run; a catalogue that simply has no row for this
+     * store and position is a decision somebody has to make in Humanity.
+     *
+     * @throws IntegrationException
+     */
+    private function scheduleFor(Shift $shift): string
+    {
+        $storeId = (int) $shift->store_id;
+
+        if ($shift->position_id === null) {
+            throw IntegrationException::guard(
+                'humanity',
+                $this->shiftsEndpoint(),
+                sprintf(
+                    'Shift #%d has no position, and Humanity requires a schedule (its name for a position) on '
+                    .'every shift. A shift with somebody on it takes its role from their profile, so this means '
+                    .'neither hiring nor TCP has a role for %s: set one on their profile in the hiring system, '
+                    .'or assign them a job code at this store in TCP. The board no longer offers a position to '
+                    .'pick here, because a role picked in scheduling was wrong in the two places nobody looks — '
+                    .'the labour cost and the published rota.',
+                    $shift->id,
+                    $shift->employee?->fullName() ?? 'the open slot (set its position when creating it)',
+                ),
+            );
+        }
+
+        $positionId = (int) $shift->position_id;
+        $scheduleId = HumanitySchedule::scheduleFor($storeId, $positionId);
+
+        if ($scheduleId !== null) {
+            return $scheduleId;
+        }
+
+        if (! HumanitySchedule::isPopulated()) {
+            throw IntegrationException::guard(
+                'humanity',
+                $this->shiftsEndpoint(),
+                sprintf(
+                    'Shift #%d cannot be published: the Humanity schedule catalogue is empty, so there is no '
+                    .'schedule id to name on it. Export GET /positions to '
+                    .'storage/app/integrations/humanity-positions.json and run '
+                    .'`php artisan db:seed --class=HumanitySeeder`.',
+                    $shift->id,
+                ),
+            );
+        }
+
+        /**
+         * TWO DIFFERENT FAILURES, and only one of them is fixable in Humanity.
+         *
+         * The catalogue is keyed by the TCP JOB CODE Humanity carries on each
+         * position, so the first question is whether TCP has a code for this
+         * store and role at all. If it does not, Humanity was never going to
+         * have a matching position and there is nothing to create there — the
+         * role does not exist in either system. If it does, the code is simply
+         * not on any Humanity position yet, which IS a five-minute fix.
+         *
+         * Told apart here rather than in one vague message, because the two send
+         * a manager to different places.
+         */
+        $storeNumber = Store::query()->whereKey($storeId)->value('store_number');
+        $jobCode = TcpJobCodeRole::jobCodeIdFor(
+            $storeNumber === null ? null : (string) $storeNumber,
+            $positionId,
+        );
+        $label = $shift->position?->label ?? 'unknown';
+
+        throw IntegrationException::guard(
+            'humanity',
+            $this->shiftsEndpoint(),
+            $jobCode === null
+                ? sprintf(
+                    'Shift #%d is for position "%s" at store #%d, and TCP has no job code for that store and '
+                    .'role — so Humanity has no schedule for it either, and creating one there would not help. '
+                    .'The board only offers roles TCP has a code for, so this shift predates that rule: move '
+                    .'it to a role the store actually staffs. Refusing to publish, because a shift with no '
+                    .'schedule is rejected by Humanity outright.',
+                    $shift->id,
+                    $label,
+                    $storeId,
+                )
+                : sprintf(
+                    'Shift #%d is for position "%s" at store #%d, which is TCP job code %s, and no Humanity '
+                    .'position carries that code. Set the job code on the store\'s "%s" position in Humanity '
+                    .'(or create it), then run `php artisan humanity:export-positions` and '
+                    .'`php artisan db:seed --class=HumanitySeeder`. Refusing to publish, because a shift with '
+                    .'no schedule is rejected by Humanity outright.',
+                    $shift->id,
+                    $label,
+                    $storeId,
+                    $jobCode,
+                    $label,
+                ),
+        );
     }
 
     /**
@@ -444,8 +619,35 @@ class SchedulePublisher
     }
 
     /**
-     * The request body: the canonical state minus the roster Humanity will not
-     * accept in a body, minus the fields we have no mapping for.
+     * The body for a CREATE: the canonical state, with the roster travelling as
+     * the employee_id parameter POST /shifts documents for exactly this.
+     *
+     * @param  array<string, mixed>  $state
+     * @return array<string, mixed>
+     */
+    private function createBody(array $state): array
+    {
+        /** @var array<int, string> $staffing */
+        $staffing = $state['staffing'] ?? [];
+        $body = $this->wireBody($state);
+
+        if ($staffing !== []) {
+            // "A comma-separated employee IDs which will be assigned to a
+            // shift". One string, not an array: the body is form-encoded, and an
+            // array would be sent as employee_id[0]=…
+            $body['employee_id'] = implode(',', $staffing);
+        }
+
+        return $body;
+    }
+
+    /**
+     * The request body: the canonical state minus the roster, which travels
+     * differently on a create and an update, minus anything with no value.
+     *
+     * The null filter is why `schedule` had to become a hard failure rather than
+     * a null: a required field that quietly disappears here produces a request
+     * that looks well-formed and is rejected for something it does not say.
      *
      * @param  array<string, mixed>  $state
      * @return array<string, mixed>

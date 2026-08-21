@@ -6,6 +6,7 @@ use App\Models\WorkSegment;
 use App\Services\Scheduling\LaborCostEstimator;
 use App\Services\Scheduling\WorkSegmentSyncService;
 use App\Support\BusinessDay;
+use Carbon\CarbonInterface;
 use Database\Seeders\DemoSeeder;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
@@ -199,8 +200,24 @@ it('soft-deletes a punch, because a punch is evidence', function () {
 
 // ── recording hours nobody punched ──────────────────────────────────────
 
+/**
+ * An employee the demo has not already punched for.
+ *
+ * A punch overlapping an existing one is refused outright now, so a test that
+ * just wants to enter hours has to pick somebody free rather than whoever
+ * happens to be first.
+ */
+function punchFreeEmployee(): Employee
+{
+    return Employee::query()->whereDoesntHave('workSegments')->orderBy('id')->firstOrFail();
+}
+
 it('records hours by hand as an unapproved manual_create, queued for TCP', function () {
-    $employee = Employee::query()->firstOrFail();
+    // Somebody with NO punches yet. The first employee is Ada, who the demo
+    // seeds a split shift and an open punch for, so a hand-entered punch for her
+    // legitimately overlaps and is now refused — see WorkSegmentService's overlap
+    // guard. These tests are about recording hours, not about overlap.
+    $employee = punchFreeEmployee();
 
     $this->post('/board/segments', [
         'store_id' => DemoSeeder::STORE_ID,
@@ -232,7 +249,11 @@ it('records hours by hand as an unapproved manual_create, queued for TCP', funct
 });
 
 it('records somebody still in the store when the clock-out is left empty', function () {
-    $employee = Employee::query()->firstOrFail();
+    // Somebody with NO punches yet. The first employee is Ada, who the demo
+    // seeds a split shift and an open punch for, so a hand-entered punch for her
+    // legitimately overlaps and is now refused — see WorkSegmentService's overlap
+    // guard. These tests are about recording hours, not about overlap.
+    $employee = punchFreeEmployee();
 
     $this->post('/board/segments', [
         'store_id' => DemoSeeder::STORE_ID,
@@ -255,7 +276,11 @@ it('records somebody still in the store when the clock-out is left empty', funct
 });
 
 it('rolls a hand-entered punch past midnight rather than refusing it', function () {
-    $employee = Employee::query()->firstOrFail();
+    // Somebody with NO punches yet. The first employee is Ada, who the demo
+    // seeds a split shift and an open punch for, so a hand-entered punch for her
+    // legitimately overlaps and is now refused — see WorkSegmentService's overlap
+    // guard. These tests are about recording hours, not about overlap.
+    $employee = punchFreeEmployee();
     $tomorrow = now()->parse($this->today)->addDay()->toDateString();
 
     $this->post('/board/segments', [
@@ -279,7 +304,11 @@ it('rolls a hand-entered punch past midnight rather than refusing it', function 
 });
 
 it('refuses a hand-entered punch whose clocks are identical', function () {
-    $employee = Employee::query()->firstOrFail();
+    // Somebody with NO punches yet. The first employee is Ada, who the demo
+    // seeds a split shift and an open punch for, so a hand-entered punch for her
+    // legitimately overlaps and is now refused — see WorkSegmentService's overlap
+    // guard. These tests are about recording hours, not about overlap.
+    $employee = punchFreeEmployee();
     $before = WorkSegment::count();
 
     // Rolled forward as an overnight punch this would be a 24-hour shift, which
@@ -304,7 +333,7 @@ it('refuses a hand-entered punch whose clocks are identical', function () {
 it('pulls the whole week from TCP in one call, not seven', function () {
     // TUESDAY-first, matching BoardController::week(). The grid runs Tuesday to
     // Monday, so the range the sync is asked for has to run the same way.
-    $monday = now()->parse($this->today)->startOfWeek(Carbon\CarbonInterface::TUESDAY)->toDateString();
+    $monday = now()->parse($this->today)->startOfWeek(CarbonInterface::TUESDAY)->toDateString();
     $sunday = now()->parse($monday)->addDays(6)->toDateString();
 
     $this->mock(WorkSegmentSyncService::class)
@@ -344,8 +373,8 @@ it('still pulls a single day when no span is given', function () {
 it('totals worked hours without inventing any for the open punch', function () {
     $segments = WorkSegment::query()->forStoreBetween(
         DemoSeeder::STORE_ID,
-        now()->parse($this->today)->startOfWeek(Carbon\CarbonInterface::TUESDAY)->toDateString(),
-        now()->parse($this->today)->startOfWeek(Carbon\CarbonInterface::TUESDAY)->addDays(6)->toDateString(),
+        now()->parse($this->today)->startOfWeek(CarbonInterface::TUESDAY)->toDateString(),
+        now()->parse($this->today)->startOfWeek(CarbonInterface::TUESDAY)->addDays(6)->toDateString(),
     )->get();
 
     $totals = app(LaborCostEstimator::class)->actualFor($segments, DemoSeeder::STORE_ID);

@@ -4,7 +4,9 @@ use App\Enums\IntegrationEntityType;
 use App\Models\Employee;
 use App\Models\IntegrationIdentity;
 use App\Models\Position;
+use App\Models\Shift;
 use App\Models\Store;
+use App\Models\TcpEmployeeJobCode;
 use App\Models\TcpJobCode;
 use App\Models\TcpJobCodeRole;
 use App\Models\WorkSegment;
@@ -158,6 +160,30 @@ function crewMemberId(): int
     return (int) Position::query()->where('label', 'Crew Member')->value('id');
 }
 
+/**
+ * Give somebody the job code TCP has assigned them, as the live endpoint reports
+ * it.
+ *
+ * THIS IS WHAT REPLACED A DROPDOWN. GET /employeejobcodes returns one per-store
+ * role code per person — across two real stores, twenty of twenty employees, and
+ * never more than one each — so a punch's jobCodeId is now looked up rather than
+ * assembled from a position somebody picked.
+ */
+function assignJobCode(int $employeeId, string $jobCodeId = '37951001', string $storeKey = '379510', string $suffix = '01'): TcpEmployeeJobCode
+{
+    return TcpEmployeeJobCode::query()->create([
+        'employee_id' => $employeeId,
+        'tcp_employee_id' => '6573538',
+        'tcp_record_id' => '10125461',
+        'job_code_id' => $jobCodeId,
+        'description' => 'Crew Member - 3795-10',
+        'store_key' => $storeKey,
+        'role_suffix' => $suffix,
+        'is_role' => true,
+        'tcp_synced_at' => now(),
+    ]);
+}
+
 /** TCP's real create envelope: data is a LIST, because the body is repeatable. */
 function fakeTcpCreate(string $id = '17727488'): void
 {
@@ -257,15 +283,23 @@ it('keeps the vendor own words when a push is rejected', function () {
 });
 
 it('does not spend a round trip to be told what it already knew', function () {
-    // A punch with no position can produce no job code, so TCP will refuse it.
-    // Saying so locally puts the fixable thing in tcp_sync_error instead of a
-    // vendor complaint about a field the manager has never heard of. No HTTP
-    // fake here on purpose: a stray request would fail this test.
+    /*
+     * A punch that can produce NO job code at all: nobody has assigned this
+     * person one, and there is no position on the row for the fallback to build
+     * one from either. TCP would refuse it, so it is refused here instead — the
+     * fixable fact lands in tcp_sync_error rather than a vendor complaint about a
+     * field no manager has heard of. No HTTP fake on purpose: a stray request
+     * fails this test.
+     *
+     * THE FAULT CHANGED WITH THE DROPDOWN. It used to read "this punch has no
+     * position on it", which was something a manager could get wrong. Nobody
+     * picks a role now, so the message names the person and the store instead.
+     */
     $segment = punch(null);
 
     app(TcpWorkSegmentWriter::class)->push($segment->fresh(['store', 'position', 'employee']));
 
-    expect($segment->fresh()->tcp_sync_error)->toContain('no position on it');
+    expect($segment->fresh()->tcp_sync_error)->toContain('no job code assigned to');
 });
 
 it('never sends a job code TCP does not have', function () {
@@ -353,22 +387,39 @@ it('refuses a punch for somebody TCP has never heard of', function () {
     expect($segment->fresh()->tcp_sync_error)->toContain('no TCP employee id');
 });
 
-it('names which of the three faults blocked the push', function () {
-    // One dead end, three genuinely different causes. Telling them apart is the
-    // difference between a message somebody can act on and a shrug.
-    $unmapped = Position::query()->create(['label' => 'Dishwasher']);
+it('names which fault blocked the push', function () {
+    /*
+     * One dead end, and the causes changed completely when the role stopped
+     * being something anybody picked. They used to be "no position", "not a TCP
+     * role" and "not at this store" — all three faults in a dropdown selection.
+     *
+     * TWO ARE REACHABLE NOW, and this names both:
+     *
+     *   store cannot form a code   its number is not in franchise-store form
+     *   person has no code here    the common one, and the actionable one
+     *
+     * A third branch covers a punch with no employee on it. It is defensive
+     * only: work_segments.employee_id is NOT NULL, so nothing can reach it, and
+     * asserting on it would mean writing a row the schema forbids.
+     */
+    $employee = mapEmployeeToTcp(Employee::query()->firstOrFail());
 
-    $noPosition = punch(null);
-    app(TcpWorkSegmentWriter::class)->push($noPosition->fresh(['store', 'position', 'employee']));
-    expect($noPosition->fresh()->tcp_sync_error)->toContain('no position on it');
+    // DemoSeeder's store number carries no franchise prefix, so no code names it.
+    $badStore = WorkSegment::query()->create([
+        'store_id' => DemoSeeder::STORE_ID,
+        'employee_id' => $employee->id,
+        'position_id' => crewMemberId(),
+        'business_date' => '2026-08-11',
+        'time_in' => '2026-08-11 21:00:00',
+        'time_out' => '2026-08-12 03:00:00',
+    ]);
+    app(TcpWorkSegmentWriter::class)->push($badStore->fresh(['store', 'position', 'employee']));
+    expect($badStore->fresh()->tcp_sync_error)->toContain('has no TCP job codes');
 
-    $notATcpRole = punch($unmapped->id);
-    app(TcpWorkSegmentWriter::class)->push($notATcpRole->fresh(['store', 'position', 'employee']));
-    expect($notATcpRole->fresh()->tcp_sync_error)->toContain('not a TCP role');
-
-    $wrongStore = punch((int) Position::query()->where('label', 'Management')->value('id'));
-    app(TcpWorkSegmentWriter::class)->push($wrongStore->fresh(['store', 'position', 'employee']));
-    expect($wrongStore->fresh()->tcp_sync_error)->toContain('no Management job code at store');
+    // A real store, a real person, and no assignment or position to build from.
+    $noAssignment = punch(null);
+    app(TcpWorkSegmentWriter::class)->push($noAssignment->fresh(['store', 'position', 'employee']));
+    expect($noAssignment->fresh()->tcp_sync_error)->toContain('no job code assigned to');
 });
 
 it('offers only the positions this store can actually file at TCP', function () {
@@ -395,27 +446,71 @@ it('offers Management at the one store that has it', function () {
     expect($labels)->toContain('Management');
 });
 
-it('refuses a hand-entered punch whose position cannot reach TCP', function () {
-    // A dropdown is not a boundary: a stale page or a hand-rolled POST can
-    // still carry a position this store cannot file. Refused while the manager
-    // is still looking at the form, rather than silently failing to sync later.
-    $driver = Position::query()->firstOrCreate(['label' => 'Driver']);
+it('refuses a hand-entered punch for somebody TCP has assigned no job code', function () {
+    /*
+     * WHAT THIS TEST USED TO BE: "a dropdown is not a boundary", refusing a
+     * position a stale page carried that this store could not file. There is no
+     * position field any more, so the boundary moved to the question that
+     * replaced it — has TCP assigned this person a code here? — and it still
+     * fails in the same place, on the form, while somebody can act on it.
+     */
+    $employee = mapEmployeeToTcp(Employee::query()->firstOrFail());
 
     $this->post('/board/segments', [
         'store_id' => 379500010,
-        'employee_id' => mapEmployeeToTcp(Employee::query()->firstOrFail())->id,
-        'position_id' => $driver->id,
+        'employee_id' => $employee->id,
         'date' => '2026-08-11',
         'time_in' => '17:00',
         'time_out' => '21:00',
-    ])->assertSessionHasErrors('position_id');
+    ])->assertSessionHasErrors('employee_id');
 
-    // Scoped to the store and date posted: DemoSeeder already puts Driver
-    // punches at its own store, and those are not what this is about.
     expect(WorkSegment::query()
         ->where('store_id', 379500010)
-        ->where('position_id', $driver->id)
+        ->where('employee_id', $employee->id)
         ->exists())->toBeFalse();
+});
+
+it('records a hand-entered punch under the job code TCP assigned, with no position field', function () {
+    $employee = mapEmployeeToTcp(Employee::query()->firstOrFail());
+    assignJobCode($employee->id);
+    fakeTcpCreate();
+
+    // NOTE WHAT IS NOT IN THIS REQUEST: position_id. The form no longer has the
+    // field, and the punch still lands with a role on it.
+    $this->post('/board/segments', [
+        'store_id' => 379500010,
+        'employee_id' => $employee->id,
+        'date' => '2026-08-11',
+        'time_in' => '17:00',
+        'time_out' => '21:00',
+    ])->assertSessionHas('ok');
+
+    $segment = WorkSegment::query()
+        ->where('store_id', 379500010)
+        ->where('employee_id', $employee->id)
+        ->latest('id')
+        ->firstOrFail();
+
+    // Derived from the employee's own TCP code, not submitted.
+    expect($segment->position_id)->toBe(crewMemberId());
+});
+
+it('sends the code TCP assigned rather than one built from the position', function () {
+    $employee = mapEmployeeToTcp(Employee::query()->firstOrFail());
+
+    // Suffix 02 is Crew Leader in the estate mapping, so this differs from
+    // whatever the position on the row would have produced.
+    assignJobCode($employee->id, '37951002', '379510', '02');
+    fakeTcpCreate();
+
+    $segment = punch(crewMemberId());
+    $segment->forceFill(['employee_id' => $employee->id])->saveQuietly();
+
+    app(TcpWorkSegmentWriter::class)->push($segment->fresh(['store', 'position', 'employee']));
+
+    // The ASSIGNMENT wins. Building 37951001 from the position on the row would
+    // file the hours under a role TCP does not have this person in.
+    Http::assertSent(fn (Request $request) => ($request->data()[0]['jobCodeId'] ?? null) === '37951002');
 });
 
 it('still records hours at a store that is not in TCP at all', function () {
@@ -434,38 +529,52 @@ it('still records hours at a store that is not in TCP at all', function () {
     ])->assertSessionHas('ok');
 });
 
-it('repairs a punch stuck against a role TCP cannot file', function () {
-    // Before this the correction dialog moved only the clocks, so the only way
-    // out of the stuck state was to delete evidence of worked hours and retype
-    // it. This is the path Alex's punch needed.
-    $driver = Position::query()->firstOrCreate(['label' => 'Driver']);
-
-    $stuck = punch($driver->id);
-    app(TcpWorkSegmentWriter::class)->push($stuck->fresh(['store', 'position', 'employee']));
-    expect($stuck->fresh()->tcp_sync_error)->toContain('not a TCP role');
-
+it('needs no repair path, because a punch cannot get stuck on a bad role any more', function () {
+    /*
+     * WHAT THIS TEST USED TO PROVE: that the correction dialog could re-file a
+     * punch recorded against a role TCP had no code for, because before it the
+     * only way out was deleting evidence of worked hours and retyping them.
+     *
+     * That punch cannot be created any more. The role comes from TCP's own
+     * assignment, so a punch that saved has a code TCP has — and the dialog is
+     * back to doing only what its name says, moving the clocks.
+     */
+    $employee = mapEmployeeToTcp(Employee::query()->firstOrFail());
+    assignJobCode($employee->id);
     fakeTcpCreate('17727999');
 
-    $this->put('/board/segments/'.$stuck->id, [
+    $segment = punch(crewMemberId());
+    $segment->forceFill(['employee_id' => $employee->id])->saveQuietly();
+
+    // A correction carrying a position is IGNORED rather than honoured: the
+    // field is gone from the form, so anything arriving in it is stale.
+    $this->put('/board/segments/'.$segment->id, [
         'date' => '2026-08-11',
-        'time_in' => '17:00',
-        'time_out' => '21:00',
-        'position_id' => crewMemberId(),
+        'time_in' => '18:00',
+        'time_out' => '22:00',
+        'position_id' => (int) Position::query()->where('label', 'Driver')->value('id'),
     ])->assertSessionHas('ok');
 
-    expect($stuck->fresh()->position_id)->toBe(crewMemberId());
+    expect($segment->fresh()->position_id)->toBe(crewMemberId());
 });
 
-it('will not let a correction re-file a punch under a role TCP cannot take', function () {
-    $shiftLead = Position::query()->firstOrCreate(['label' => 'Shift Lead']);
+it('will not let a correction re-file a punch under any role at all', function () {
+    // Stronger than the rule it replaces. That one refused roles TCP could not
+    // take; this one refuses to move the role FULL STOP, because the role is
+    // TCP's to decide and a time correction is not the place to change it.
+    $employee = mapEmployeeToTcp(Employee::query()->firstOrFail());
+    assignJobCode($employee->id);
+    fakeTcpCreate();
+
     $segment = punch(crewMemberId());
+    $segment->forceFill(['employee_id' => $employee->id])->saveQuietly();
 
     $this->put('/board/segments/'.$segment->id, [
         'date' => '2026-08-11',
         'time_in' => '17:00',
         'time_out' => '21:00',
-        'position_id' => $shiftLead->id,
-    ])->assertSessionHasErrors('position_id');
+        'position_id' => (int) Position::query()->where('label', 'Crew Leader')->value('id'),
+    ])->assertSessionHas('ok');
 
     expect($segment->fresh()->position_id)->toBe(crewMemberId());
 });
@@ -553,14 +662,20 @@ it('offers only TCP roles in the day board dropdowns', function () {
         ->and($labels)->not->toContain('Shift Lead');
 });
 
-it('keeps a shift on its own role in the edit form when TCP has no code for it', function () {
-    // THE ONE PLACE THE FILTER MUST NOT WIN. Dropping the shift's own position
-    // would preselect whatever came first, so saving a time change would
-    // silently re-file the shift under a role nobody rostered — the filter
-    // causing the exact class of quiet error it exists to prevent.
+it("shows a shift's own role in the edit form instead of offering to change it", function () {
+    /*
+     * WHAT THIS TEST USED TO GUARD: the edit form's position dropdown had to
+     * keep the shift's own role on the list even when TCP had no code for it,
+     * because dropping it would preselect whatever came first and a plain time
+     * change would silently re-file the shift under a role nobody rostered.
+     *
+     * The dropdown is gone, so that whole hazard is gone with it — there is
+     * nothing to preselect wrongly. The role is PRINTED, so it is still visible;
+     * it is just no longer something a time correction can move by accident.
+     */
     $driver = Position::query()->firstOrCreate(['label' => 'Driver']);
 
-    $shift = App\Models\Shift::query()->create([
+    Shift::query()->create([
         'store_id' => 379500010,
         'employee_id' => Employee::query()->value('id'),
         'position_id' => $driver->id,
@@ -571,8 +686,11 @@ it('keeps a shift on its own role in the edit form when TCP has no code for it',
 
     $html = $this->get('/board?store=379500010&date=2026-08-11')->assertOk()->getContent();
 
-    expect($html)->toContain('Driver — no TCP job code')
-        ->and($html)->toContain('value="'.$shift->position_id.'" selected');
+    // Still visible...
+    expect($html)->toContain('Driver');
+
+    // ...and no longer an editable field on the shift row.
+    expect($html)->not->toContain('id="seg-position"');
 });
 
 it('offers the estate\'s roles at a store TCP does not carry, and says so', function () {

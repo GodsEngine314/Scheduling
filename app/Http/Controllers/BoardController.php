@@ -12,6 +12,7 @@ use App\Models\EmployeeRequest;
 use App\Models\Position;
 use App\Models\Shift;
 use App\Models\Store;
+use App\Models\TcpEmployeeJobCode;
 use App\Models\TcpJobCodeRole;
 use App\Models\User;
 use App\Models\WorkSegment;
@@ -20,9 +21,12 @@ use App\Services\Scheduling\EmployeeRequestService;
 use App\Services\Scheduling\HourlyHeadcountCounter;
 use App\Services\Scheduling\HourlySalesReader;
 use App\Services\Scheduling\LaborCostEstimator;
+use App\Services\Scheduling\LiveSegmentFeed;
 use App\Services\Scheduling\SchedulePublisher;
+use App\Services\Scheduling\ShiftRangeService;
 use App\Services\Scheduling\ShiftService;
 use App\Services\Scheduling\StoreSettingService;
+use App\Services\Scheduling\TcpEmployeeJobCodeReader;
 use App\Services\Scheduling\TcpEmployeeReader;
 use App\Services\Scheduling\WorkSegmentService;
 use App\Services\Scheduling\WorkSegmentSyncService;
@@ -34,7 +38,9 @@ use Database\Seeders\DemoSeeder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 use Illuminate\View\View;
@@ -54,9 +60,6 @@ class BoardController extends Controller
     /** The store the roster was last read from TCP for. See pullEmployeesOnStoreChange(). */
     private const EMPLOYEE_PULL_KEY = 'tcp_employee_pull_store';
 
-    /** The store+range the punches were last read from TCP for. See pullSegmentsOnRangeChange(). */
-    private const SEGMENT_PULL_KEY = 'tcp_segment_pull_range';
-
     public function __construct(
         private readonly BoardService $board,
         private readonly ShiftService $shifts,
@@ -71,6 +74,9 @@ class BoardController extends Controller
         private readonly StoreSettingService $settings,
         private readonly HourlySalesReader $sales,
         private readonly HourlyHeadcountCounter $heads,
+        private readonly LiveSegmentFeed $live,
+        private readonly TcpEmployeeJobCodeReader $tcpJobCodes,
+        private readonly ShiftRangeService $range,
     ) {}
 
     public function index(Request $request): View
@@ -115,6 +121,21 @@ class BoardController extends Controller
             'shifts' => $shifts,
             'segments' => $segments,
             'conflicts' => $conflicts,
+            // The status pill's opening reading. Taken from our own table with
+            // no vendor call, so the page paints at once; the poll that starts
+            // half a second later is what makes it current.
+            'live' => $this->live->snapshot($storeId, $date, $date),
+            // What the two range buttons would touch. Counted here so the labels
+            // can name the number — which is the only thing standing between a
+            // manager and a day they did not mean to clear.
+            'range' => $this->range->summary($storeId, $date, $date),
+            // What TCP will file each person's hours as. The forms print it
+            // beside the name, now that nobody picks it.
+            //
+            // ON THIS DATE, because hiring's answer is effective-dated: a shift
+            // read after a promotion carries the new role, and the option has to
+            // say the same thing the save will store.
+            'jobCodes' => $this->jobCodesForForms($storeId, $date),
             'positions' => Position::query()->orderBy('id')->get(),
             // The same rule the week view follows: dropdowns offer only roles
             // TCP has a job code for, and the strict list rides along so the
@@ -128,7 +149,11 @@ class BoardController extends Controller
             'roster' => $this->roster($storeId, $date),
             // What the publish button is about to send, so the count is on the
             // button rather than a surprise after pressing it.
-            'publishable' => $this->publisher->pendingInRange($storeId, $date, $date)->count(),
+            'publishable' => ($pending = $this->publisher->pendingInRange($storeId, $date, $date))->count(),
+            // How many of those Humanity is ALREADY holding, which is what makes
+            // the button say "Republish" instead of "Publish". A manager who has
+            // just unpublished something wants to see that word.
+            'republishable' => $pending->whereNotNull('humanity_shift_id')->count(),
             'requests' => EmployeeRequest::query()
                 ->with(['employee', 'decisions'])
                 ->where('store_id', $storeId)
@@ -176,6 +201,15 @@ class BoardController extends Controller
             return;
         }
 
+        // IMMEDIATELY AFTER THE ROSTER, and only when it succeeded: the job code
+        // pull is driven by the TCP ids the roster pull has just confirmed, so
+        // running it first would ask about people it had not mapped yet.
+        //
+        // This is what removed the position dropdown. Nobody presses anything
+        // for it, on the same principle as the punch heartbeat: if TCP knows the
+        // answer, the console should not be asking a manager for it.
+        $this->pullEmployeeJobCodes($storeId);
+
         // Not configured, or not mapped: both are ordinary states in a service
         // that is still being wired up, and neither is worth shouting about on
         // a screen somebody opened to look at a schedule.
@@ -218,53 +252,265 @@ class BoardController extends Controller
     }
 
     /**
-     * Read the week's punches from TCP the first time the actual tab lands on it.
+     * Read each employee's TCP job code assignments.
      *
-     * WHY THIS EXISTS. The tab rendered whatever had already been pulled, and
-     * nothing pulled unless somebody found the "Pull the week's actual hours"
-     * button and pressed it. So a store nobody had pressed it for showed an
-     * empty grid that was indistinguishable from "nobody worked" — the punches
-     * were sitting in TCP the whole time. Picking a week and pressing Go now
-     * fetches it, which is what pressing Go looks like it should do.
+     * WHAT THIS REPLACED: a Position dropdown on every form. A punch needs a
+     * jobCodeId and it used to be assembled from a picked position — see
+     * TcpJobCodeRole::jobCodeIdFor(), which survives only for the open-shift
+     * case that has no person in it. Assembling a code is guessing whether TCP
+     * has it, and it frequently does not.
      *
-     * ON CHANGE, NOT ON RENDER, and keyed on store AND week — the same bargain
-     * pullEmployeesOnStoreChange() strikes, for the same reason. Every approve,
-     * correct and delete on this tab redirects back here, and a vendor round
-     * trip on each would put TCP's latency in front of every click. Stepping
-     * through a month costs four calls; clicking about within one week costs
-     * none.
+     * SILENT WHEN IT WORKS. This runs on a store change, behind the roster pull
+     * that just reported its own numbers; a second banner saying job codes also
+     * loaded is noise on a screen somebody opened to read a schedule. The one
+     * thing worth saying is the case that leaves a form unable to file hours,
+     * and the form says that itself, per person, where it can be acted on.
      *
-     * NOTHING HERE CAN BREAK THE PAGE. The pull is a convenience; the hours
-     * already in the table are not. Any failure degrades to a message and the
-     * grid renders exactly as it would have.
-     *
-     * The button stays. This runs once per store-range, and re-pulling on demand
-     * is free — the upsert is keyed on tcp_segment_id — so the way to get a
-     * punch somebody made in the last minute is still to ask for it.
-     *
-     * Both boards call this. The key carries the whole range rather than just
-     * its start, so a day board on Monday and a week board starting Monday are
-     * two different pulls — otherwise opening the day first would convince the
-     * week it had already fetched its other six days.
+     * CANNOT BREAK THE PAGE, for the same reason nothing else on this render
+     * path can: the mappings already stored are not a convenience, only their
+     * freshness is.
      */
-    private function pullSegmentsOnRangeChange(Request $request, int $storeId, string $from, string $to): void
+    private function pullEmployeeJobCodes(int $storeId): void
     {
-        $key = $storeId.':'.$from.':'.$to;
+        try {
+            // The report is deliberately not read. People TCP assigns codes to
+            // who are in no hiring event we have seen are the one interesting
+            // case, and the roster pull above already reports that same fact
+            // from the other side — saying it twice on one render helps nobody.
+            // `scheduling:sync-employee-job-codes` prints the full report.
+            $this->tcpJobCodes->syncStore($storeId);
+        } catch (Throwable $e) {
+            $this->flashNow('err', 'Could not read job codes from TCP — '
+                .class_basename($e).': '.$e->getMessage());
+        }
+    }
 
-        if (! $request->hasSession() || $request->session()->get(self::SEGMENT_PULL_KEY) === $key) {
+    /**
+     * The position for somebody's shift or punch, DERIVED rather than picked.
+     *
+     * This is the whole of what the removed dropdowns used to be asked for. TCP
+     * assigns each person a job code per store — 37951001 is "Crew Member" at
+     * store 10 — and the trailing two digits are already mapped to our
+     * positions, so the answer a manager was typing in was one TCP could give.
+     *
+     * The board still STORES a position on every row: the cost estimator reads
+     * it, the chips print it, and Humanity refuses a shift without one. So the
+     * field went, the value did not.
+     *
+     * Null when TCP has no assignment for this person at this store. That is a
+     * real state, not an error here — a punch refuses it loudly, because hours
+     * with no code cannot be filed, while a plan tolerates it, because a plan is
+     * ours until somebody publishes it.
+     */
+    private function derivedPositionId(int $storeId, ?int $employeeId): ?int
+    {
+        if ($employeeId === null) {
+            return null;
+        }
+
+        return TcpEmployeeJobCode::positionIdFor($employeeId, $this->storeNumberFor($storeId));
+    }
+
+    /**
+     * The position for a PLANNED shift, read off the person rather than a form.
+     *
+     * TWO SOURCES, BOTH THE PERSON'S, in a fixed order:
+     *
+     *   1. TCP's assignment at this store. Store-specific — 37951001 is Crew
+     *      Member at store 10 and says nothing about store 42 — and the only
+     *      answer both vendors can carry: it is by definition a code TCP has, and
+     *      its role maps to a Humanity schedule, so a shift built from it can be
+     *      published AND its hours filed.
+     *   2. What HIRING says they are employed as, effective-dated so a shift
+     *      after a promotion carries the new role. This is the system of record
+     *      for the fact, and it answers for everybody TCP has no assignment for —
+     *      which was the hole this fell through before.
+     *
+     * TCP FIRST DESPITE HIRING OWNING THE FACT, and the reason is narrow: hiring's
+     * vocabulary is wider than either vendor's. Driver, Insider and Shift Lead are
+     * real jobs that exist in no TCP job code and no Humanity schedule, so
+     * preferring hiring would take a person TCP has already placed as Crew Member
+     * and roster them as something that cannot publish. Where the two disagree,
+     * TCP's is the answer that works; where TCP is silent, hiring's is the only
+     * answer there is. Neither is a scheduling pick, which is the point.
+     *
+     * NULL STOPS HERE. It used to fall through to whatever position_id the request
+     * carried, which by then came from a select the manager could not see — so
+     * somebody neither system knew about was quietly rostered as whatever happened
+     * to be first in the list, and their labour cost and their published schedule
+     * both said so. A plan with no role is honest and visible: the option says the
+     * profile is empty, the chip prints no role, and SchedulePublisher refuses it
+     * by name with the two places to go and fix it.
+     *
+     * The one manual position left on the console is an OPEN slot's, which has no
+     * person to read anything off.
+     */
+    private function plannedPositionId(int $storeId, ?int $employeeId, ?string $date = null): ?int
+    {
+        if ($employeeId === null) {
+            return null;
+        }
+
+        return $this->derivedPositionId($storeId, $employeeId)
+            ?? Employee::query()->find($employeeId)?->positionIdOn($date);
+    }
+
+    /**
+     * Refuse a hand-entered punch for somebody TCP has no job code for here.
+     *
+     * Thrown as a VALIDATION error rather than an exception, so it lands back on
+     * the form beside the field that caused it instead of on an error page — the
+     * same shape guardPushablePosition() uses, and on employee_id because that is
+     * the field somebody can actually change in response.
+     *
+     * A STORE TCP CANNOT NAME IS A DIFFERENT SITUATION and returns early. "TCP
+     * has not assigned this person a code here" is something a manager can get
+     * fixed; "this store is not in TCP" is not about the person at all, and
+     * refusing every punch would stop a store recording worked hours to solve a
+     * timeclock problem it does not have. The hours save and the chip says why
+     * they cannot be pushed — see the same reasoning in guardPushablePosition().
+     */
+    private function guardEmployeeHasJobCode(int $storeId, int $employeeId): void
+    {
+        $storeNumber = $this->storeNumberFor($storeId);
+
+        if (TcpJobCodeRole::storeKeyFor($storeNumber) === null) {
             return;
         }
 
-        // Recorded BEFORE the call: a week whose pull fails must not retry on
-        // every subsequent render of the same grid.
-        $request->session()->put(self::SEGMENT_PULL_KEY, $key);
+        if (TcpEmployeeJobCode::roleFor($employeeId, $storeNumber) !== null) {
+            return;
+        }
 
+        $who = Employee::query()->find($employeeId)?->fullName() ?? 'That employee';
+
+        throw ValidationException::withMessages([
+            'employee_id' => $who.' has no TCP job code at store '.($storeNumber ?? $storeId)
+                .', so TCP cannot be told what role their hours were worked as. Assign them a job code at this '
+                .'store in TCP — the board reads assignments hourly, and immediately when you switch stores and back.',
+        ]);
+    }
+
+    /**
+     * Each employee's ROLE, from their profile, for the forms to show.
+     *
+     * REMOVING A DROPDOWN MUST NOT REMOVE THE INFORMATION. A manager picking a
+     * position at least knew what role the hours would be filed as; deleting the
+     * field without putting that fact back would make the form quieter and less
+     * honest at the same time. So every employee option carries their role, and
+     * anyone with none says so on the option itself — before it is chosen, rather
+     * than as an error after.
+     *
+     * BOTH SOURCES, SEPARATELY, because the two forms need different ones and
+     * collapsing them would put a label on an option that the save then
+     * contradicts. A PUNCH needs TCP's code — no code, no hours — so that form
+     * reads `tcp` and disables anyone without it. A PLANNED shift needs only a
+     * role, so it reads `tcp` then `hiring`, the same order plannedPositionId()
+     * resolves in, and what the option says is what the shift will store.
+     *
+     * Two queries for the whole form, keyed by employee id.
+     *
+     * @return array<int,array{tcp: ?array{label: string, code: string}, hiring: ?array{label: string}}>
+     */
+    private function jobCodesForForms(int $storeId, ?string $date = null): array
+    {
+        $positions = Position::query()->pluck('label', 'id');
+        $roles = [];
+
+        // HIRING, the system of record for what somebody is employed as. Read
+        // outside the store-key guard below because a store TCP cannot name
+        // leaves this as the only source there is.
+        foreach (Employee::query()
+            ->forStore($storeId)
+            ->schedulable()
+            ->with('positions')
+            ->get() as $employee) {
+            $positionId = $employee->positionIdOn($date);
+
+            if ($positionId === null) {
+                continue;
+            }
+
+            $roles[(int) $employee->id]['hiring'] = [
+                'label' => (string) ($positions[$positionId] ?? 'position #'.$positionId),
+            ];
+        }
+
+        $storeKey = TcpJobCodeRole::storeKeyFor($this->storeNumberFor($storeId));
+
+        if ($storeKey === null) {
+            return $roles;
+        }
+
+        // TCP, the timeclock's own assignment, which is what a punch is filed
+        // under whatever hiring believes.
+        foreach (TcpEmployeeJobCode::query()
+            ->where('is_role', true)
+            ->where('store_key', $storeKey)
+            ->get() as $row) {
+            $positionId = $row->positionId();
+
+            $roles[(int) $row->employee_id]['tcp'] = [
+                // OUR label when the suffix is mapped, TCP's own when it is not —
+                // a code we cannot translate is still a code, and printing the raw
+                // description beats printing nothing.
+                'label' => $positionId === null
+                    ? (string) ($row->description ?? $row->job_code_id)
+                    : (string) ($positions[$positionId] ?? $row->description ?? $row->job_code_id),
+                'code' => (string) $row->job_code_id,
+            ];
+        }
+
+        return $roles;
+    }
+
+    /** The number on the building, which is what a job code is built from. */
+    private function storeNumberFor(int $storeId): ?string
+    {
+        return Store::query()->whereKey($storeId)->value('store_number');
+    }
+
+    /**
+     * Read the visible range from TCP as part of rendering it.
+     *
+     * WHY THIS STILL EXISTS NOW THAT THERE IS A HEARTBEAT. The heartbeat (see
+     * LiveSegmentFeed and board/_live.blade.php) is what keeps an open board
+     * current from one second to the next. This is about the FIRST paint: a
+     * grid that renders empty and fills in a second later is a grid somebody
+     * can read the wrong answer off, and "nobody worked" is exactly the wrong
+     * answer to show while the truth is still in flight.
+     *
+     * ONE SET OF BOOKS WITH THE HEARTBEAT. This used to key off a session value
+     * of its own, which meant a navigation pulled the range and the first poll
+     * half a second later pulled the very same range again — it had never heard
+     * of the session key. Both now go through LiveSegmentFeed::refresh(), which
+     * holds one shared record of when each range was last read. Two consequences
+     * worth having: no duplicate call per navigation, and freshness shared
+     * between PEOPLE — the second manager to open Tuesday does not pay for a
+     * round trip the first one already made.
+     *
+     * NOTHING HERE CAN BREAK THE PAGE. The pull is a convenience; the hours
+     * already in the table are not. Any failure degrades to a message and the
+     * grid renders exactly as it would have — and the heartbeat will keep
+     * retrying it on its own interval afterwards.
+     */
+    private function pullSegmentsOnRangeChange(Request $request, int $storeId, string $from, string $to): void
+    {
         try {
-            $result = $this->segmentSync->syncRange($from, $to, $storeId);
+            $result = $this->live->refresh($storeId, $from, $to);
         } catch (Throwable $e) {
-            $this->flashNow('err', 'Could not read this week\'s hours from TCP — '
+            // refresh() swallows vendor failures into the range's state so the
+            // heartbeat can report them, so reaching here means something more
+            // unusual. Still not fatal: the grid is a query result either way.
+            $this->flashNow('err', "Could not read this week's hours from TCP — "
                 .class_basename($e).': '.$e->getMessage());
 
+            return;
+        }
+
+        // null is "the range was already fresh, or somebody else is fetching it
+        // right now". Neither is news.
+        if ($result === null) {
             return;
         }
 
@@ -502,8 +748,19 @@ class BoardController extends Controller
             ),
             'costs' => $this->costs->estimateFor($shifts, $storeId, null),
             'actuals' => $this->costs->actualFor($segments, $storeId),
-            'publishable' => $this->publisher->pendingInRange($storeId, $days->first(), $days->last())->count(),
+            'publishable' => ($pending = $this->publisher
+                ->pendingInRange($storeId, $days->first(), $days->last()))->count(),
+            'republishable' => $pending->whereNotNull('humanity_shift_id')->count(),
             'timezone' => $this->businessDay->timezoneFor($storeId),
+            // See the note in index(). Keyed on the whole week, which is the
+            // range the poll will keep warm.
+            'live' => $this->live->snapshot($storeId, $days->first(), $days->last()),
+            // See the note in index(). Keyed on the whole week, which is exactly
+            // what the buttons act on.
+            'range' => $this->range->summary($storeId, $days->first(), $days->last()),
+            // See the note in index(). One query, keyed by employee id, dated
+            // to the first day on screen.
+            'jobCodes' => $this->jobCodesForForms($storeId, $days->first()),
             /**
              * WHAT THE STORE WAS DOING WHILE THEY WORKED — read from
              * LC_PIZZA_DATA, never stored here. Two people on at 11:00 is right
@@ -533,50 +790,6 @@ class BoardController extends Controller
     }
 
     /**
-     * Refuse a position whose hours this store cannot file at TCP.
-     *
-     * Thrown as a VALIDATION error rather than an exception, so it lands back
-     * on the form beside the field that caused it instead of on an error page.
-     */
-    private function guardPushablePosition(int $storeId, int $positionId): void
-    {
-        $store = Store::query()->find($storeId);
-        $pushable = TcpJobCodeRole::positionIdsPushableAt($store?->store_number);
-
-        if (in_array($positionId, $pushable, true)) {
-            return;
-        }
-
-        // A STORE WITH NO JOB CODES AT ALL IS A DIFFERENT SITUATION, and
-        // collapsing the two was wrong. "You picked a role TCP does not have
-        // here" is a choice the manager can correct on the spot. "This store is
-        // not in TCP" is not about the position at all — refusing every option
-        // would make the store unable to record worked hours, which is a
-        // schedule problem invented to solve a timeclock one.
-        //
-        // So the hours are recorded and the push reports why it cannot go. The
-        // demo store is the obvious case; a real store missing from TCP is a
-        // misconfiguration that shows up on the chip rather than as a form that
-        // rejects everything.
-        if ($pushable === []) {
-            return;
-        }
-
-        $label = Position::query()->whereKey($positionId)->value('label') ?? 'That position';
-
-        $alternatives = Position::query()
-            ->whereIn('id', $pushable)
-            ->orderBy('id')
-            ->pluck('label')
-            ->implode(', ');
-
-        throw ValidationException::withMessages([
-            'position_id' => $label.' has no TCP job code at store '.($store?->store_number ?? $storeId)
-                .', so hours recorded against it could never reach the timeclock. Use one of: '.$alternatives.'.',
-        ]);
-    }
-
-    /**
      * The grid's rows on the ACTUAL side: the roster, plus anybody who punched
      * here this week and is not on it.
      *
@@ -597,7 +810,7 @@ class BoardController extends Controller
      * appended instead, marked off_roster so the row can say why it is there.
      *
      * @param  array<int, array<string, mixed>>  $roster
-     * @param  \Illuminate\Support\Collection<int, WorkSegment>  $segments
+     * @param  Collection<int, WorkSegment>  $segments
      * @return array<int, array<string, mixed>>
      */
     private function rowsForActual(array $roster, $segments, string $date): array
@@ -703,6 +916,33 @@ class BoardController extends Controller
         try {
             $shift = $action($data['business_date'] ?? null, $employeeId);
 
+            /*
+             * THE ROLE FOLLOWS THE PERSON, and a drop onto another row IS a
+             * reassignment. move() and copy() both carry the position over
+             * untouched, which was right while a manager picked it — the shift
+             * kept what somebody chose for it — and is wrong now that it belongs
+             * to whoever is on it: dragging a Crew Member's shift onto an
+             * Assistant Manager left it costed and published as Crew Member,
+             * with nothing on screen saying so.
+             *
+             * Only when a PERSON is named. A drop on the open-shifts row keeps
+             * the role, because that is the whole content of an open slot, and a
+             * drag that does not touch the employee has nothing to re-read.
+             */
+            if ($employeeId !== false && $employeeId !== null) {
+                $derived = $this->plannedPositionId(
+                    (int) $shift->store_id,
+                    (int) $employeeId,
+                    $this->dateOf($shift->business_date),
+                );
+
+                // Null leaves the shift's own role alone rather than clearing it,
+                // for the same reason updateShift() does — see the note there.
+                if ($derived !== null && $derived !== (int) $shift->position_id) {
+                    $shift = $this->shifts->update($shift, ['position_id' => $derived]);
+                }
+            }
+
             return response()->json([
                 'ok' => true,
                 'shift_id' => (int) $shift->id,
@@ -722,6 +962,63 @@ class BoardController extends Controller
     private function dateOf(mixed $date): string
     {
         return $date instanceof CarbonInterface ? $date->toDateString() : (string) $date;
+    }
+
+    /**
+     * THE HEARTBEAT. Answers one question — "has anything changed?" — and
+     * refreshes the range from TCP while it is there.
+     *
+     * This is what replaced "Pull the week's actual hours". A button made the
+     * board's currency somebody's chore, and an out-of-date grid looks exactly
+     * as settled as a current one, so the mistake was invisible. See
+     * LiveSegmentFeed for why the vendor call happens HERE, inside a poll
+     * nobody is waiting on, rather than in the page render or a queued job.
+     *
+     * ALWAYS 200, EVEN WHEN TCP IS DOWN. A polling loop that gets an error
+     * status is a polling loop that stops; the failure belongs in the payload,
+     * where the status pill can show it and the next tick can still run.
+     *
+     * GET, and it changes no state of ours — it only reads from the vendor into
+     * a table that is a mirror of the vendor. Nothing here is a domain write,
+     * which is why it is safe to have a page call it every few seconds.
+     */
+    public function live(Request $request): JsonResponse
+    {
+        /*
+         * Validator::make, NOT $request->validate().
+         *
+         * This is a console route, and bootstrap/app.php deliberately renders
+         * JSON only for api/*  — so a ValidationException thrown here comes back
+         * as a 302 to the referring page. For an ordinary form that is exactly
+         * right. For a polling endpoint it is poison: the browser follows the
+         * redirect, gets HTML, fails to parse it, and the heartbeat reports the
+         * console as unreachable when the only thing wrong was a query string.
+         *
+         * So the failure is handled rather than thrown, and every response from
+         * this action is JSON whatever happens.
+         */
+        $validator = Validator::make($request->query(), [
+            'store' => ['required', 'integer', 'exists:stores,id'],
+            'from' => ['required', 'date_format:Y-m-d'],
+            // A day board polls with from === to. One request either way: the
+            // TCP filter takes a range.
+            'to' => ['required', 'date_format:Y-m-d', 'after_or_equal:from'],
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'error' => $validator->errors()->first(),
+                // No fingerprint on purpose: there is no range to have one for,
+                // and a made-up value would tell the page its grid had changed.
+                'fingerprint' => null,
+            ], 422);
+        }
+
+        $data = $validator->validated();
+
+        return response()->json(
+            $this->live->poll((int) $data['store'], $data['from'], $data['to'])
+        );
     }
 
     /**
@@ -807,11 +1104,9 @@ class BoardController extends Controller
      */
     public function publish(Request $request): RedirectResponse
     {
-        $data = $request->validate([
-            'store_id' => ['required', 'integer', 'exists:stores,id'],
-            'from' => ['required', 'date_format:Y-m-d'],
-            'to' => ['required', 'date_format:Y-m-d', 'after_or_equal:from'],
-        ]);
+        // Shared with the two bulk actions, so the three range controls on this
+        // console cannot disagree about what "in view" means.
+        $data = $this->validateRange($request);
 
         try {
             $result = $this->publisher->publishRange((int) $data['store_id'], $data['from'], $data['to']);
@@ -844,14 +1139,128 @@ class BoardController extends Controller
      * PUT rather than creating a duplicate. Employees see the last published
      * version until then.
      */
-    public function unpublishShift(Request $request, Shift $shift): RedirectResponse
+    /**
+     * Unlock every published shift in the visible range for editing.
+     *
+     * ONE BUTTON FOR THE WEEK, where there used to be a padlock on every chip.
+     * The rule has not changed — a published shift cannot be edited, moved or
+     * deleted until it is unlocked — but the grain was wrong: the workflow is
+     * "unpublish, change the week, republish", and doing it a shift at a time
+     * meant fourteen clicks before a manager could touch anything.
+     *
+     * NOTHING IS SENT TO HUMANITY. Unlocking is local: the shifts stay live on
+     * everybody's roster exactly as they are, and the next publish sends the
+     * changes as a PUT over the same shift. This is the sentence the flash has
+     * to carry, because "unpublish" reads like a withdrawal and is not one.
+     */
+    public function unpublishShifts(Request $request): RedirectResponse
     {
-        return $this->attempt(
-            $request,
-            fn () => $this->publisher->unpublish($shift),
-            "Shift #{$shift->id} unpublished and editable. It is still live in Humanity — "
-                .'re-publish to send the change as a PUT.',
-        );
+        $data = $this->validateRange($request);
+
+        try {
+            $result = $this->range->unpublishRange(
+                (int) $data['store_id'],
+                $data['from'],
+                $data['to'],
+            );
+        } catch (SchedulingException $e) {
+            return back()->with('err', $e->getMessage());
+        } catch (Throwable $e) {
+            return back()->with('err', class_basename($e).': '.$e->getMessage());
+        }
+
+        if ($result['unlocked'] === 0) {
+            return back()->with('ok', $result['total'] === 0
+                ? 'No shifts in view to unpublish.'
+                : 'Nothing to unpublish — no shift in view is locked.');
+        }
+
+        return back()->with('ok', $result['unlocked'].' shift'.($result['unlocked'] === 1 ? '' : 's')
+            .' unpublished and editable. '
+            .($result['unlocked'] === 1 ? 'It is' : 'They are').' still live in Humanity — '
+            .'republish to send the changes as PUTs over the same shifts.');
+    }
+
+    /**
+     * Delete every shift in the visible range.
+     *
+     * SCOPED TO WHAT IS ON SCREEN, and the count is in the button's own label so
+     * the scope cannot be misread. "All" here means the store and the span the
+     * board is showing, never the table.
+     *
+     * Humanity is told first and a shift whose withdrawal fails is NOT deleted —
+     * see ShiftRangeService::deleteRange() for why that order is the only safe
+     * one. A partial failure is reported loudly and leaves the rest of the week
+     * deleted, because the shifts that did come out of Humanity are gone there
+     * and must be gone here too.
+     */
+    public function destroyShifts(Request $request): RedirectResponse
+    {
+        $data = $this->validateRange($request);
+
+        try {
+            $result = $this->range->deleteRange(
+                (int) $data['store_id'],
+                $data['from'],
+                $data['to'],
+            );
+        } catch (SchedulingException $e) {
+            return back()->with('err', $e->getMessage());
+        } catch (Throwable $e) {
+            return back()->with('err', class_basename($e).': '.$e->getMessage());
+        }
+
+        if ($result['total'] === 0) {
+            return back()->with('ok', 'No shifts in view to delete.');
+        }
+
+        $message = $result['deleted'].' shift'.($result['deleted'] === 1 ? '' : 's').' deleted.';
+
+        if ($result['withdrawn'] > 0) {
+            $message .= ' '.$result['withdrawn'].' withdrawn from Humanity, so nobody is still rostered for '
+                .($result['withdrawn'] === 1 ? 'it' : 'them').'.';
+        }
+
+        // Soft delete, so the punches keep pointing at the rows. Said out loud
+        // rather than left for somebody to wonder about: the hours are not gone.
+        if ($result['punches'] > 0) {
+            $message .= ' '.$result['punches'].' punch(es) still reference the deleted shifts, so the pairings '
+                .'survive a restore.';
+        }
+
+        if ($result['failures'] === []) {
+            return back()->with('ok', $message);
+        }
+
+        // NAMED, NOT COUNTED. These are shifts Humanity would not release, which
+        // means they are still on somebody's roster and still on this board — the
+        // manager can press delete again once the vendor is reachable.
+        $named = collect($result['failures'])
+            ->take(5)
+            ->map(fn (array $row): string => '#'.$row['shift_id'])
+            ->join(', ');
+
+        return back()->with('err', $message.' '.count($result['failures']).' could NOT be withdrawn from Humanity ('
+            .$named.(count($result['failures']) > 5 ? ', …' : '').') and were left in place — they are still live '
+            .'there. '.($result['failures'][0]['reason'] ?? ''));
+    }
+
+    /**
+     * The store and span both bulk actions take.
+     *
+     * Identical to what publish() validates, and on purpose: the three range
+     * actions on this console must agree about what "in view" means, or one of
+     * them acts on a different set of shifts than the label beside it claims.
+     *
+     * @return array<string,string>
+     */
+    private function validateRange(Request $request): array
+    {
+        return $request->validate([
+            'store_id' => ['required', 'integer', 'exists:stores,id'],
+            'from' => ['required', 'date_format:Y-m-d'],
+            'to' => ['required', 'date_format:Y-m-d', 'after_or_equal:from'],
+        ]);
     }
 
     public function storeShift(Request $request): RedirectResponse
@@ -860,6 +1269,18 @@ class BoardController extends Controller
             'store_id' => ['required', 'integer'],
             'date' => ['required', 'date_format:Y-m-d'],
             'employee_id' => ['nullable', 'integer', 'exists:employees,id'],
+            /*
+             * ACCEPTED ONLY FOR AN OPEN SHIFT, and overridden otherwise.
+             *
+             * When there is a person on the shift the role is THEIRS and comes
+             * from their profile — hiring first, then TCP's own assignment; see
+             * plannedPositionId(). When there is not, there is
+             * nobody to inherit from and the role IS the shift's whole content:
+             * "we need a Driver on Friday" is the entire point of an open slot,
+             * and Humanity refuses a shift with no position on it. So this one
+             * field survives the removal of the dropdowns, for the one case
+             * that has no employee in it.
+             */
             'position_id' => ['nullable', 'integer', 'exists:positions,id'],
             'start' => ['required', 'date_format:H:i'],
             'end' => ['required', 'date_format:H:i'],
@@ -872,10 +1293,31 @@ class BoardController extends Controller
             ? now()->parse($data['date'])->addDay()->toDateString()
             : $data['date'];
 
+        $storeId = (int) $data['store_id'];
+        $employeeId = $data['employee_id'] ?? null;
+
+        /*
+         * THE PERSON'S RECORD WINS over anything the request carried — a stale
+         * page or a hand-rolled POST cannot book somebody as a role their profile
+         * does not give them, which is the class of bug the dropdown kept
+         * producing.
+         *
+         * AND NO ANSWER IS NOT A LICENCE TO GUESS. This used to fall through to
+         * the request's position_id, which by then came from a select the manager
+         * could not see — so anybody hiring and TCP both knew nothing about was
+         * rostered as whatever came first in the list. That shift published, and
+         * costed, under a role nobody chose. A null position instead leaves the
+         * shift visibly roleless: the publish refuses it by name and says where to
+         * set it, which is hiring.
+         */
+        $positionId = $employeeId === null
+            ? ($data['position_id'] ?? null)
+            : $this->plannedPositionId($storeId, (int) $employeeId, $data['date']);
+
         return $this->attempt($request, fn () => $this->shifts->create([
-            'store_id' => (int) $data['store_id'],
-            'employee_id' => $data['employee_id'] ?? null,
-            'position_id' => $data['position_id'] ?? null,
+            'store_id' => $storeId,
+            'employee_id' => $employeeId,
+            'position_id' => $positionId,
             'start_at_local' => "{$data['date']} {$data['start']}:00",
             'end_at_local' => "{$endDate} {$data['end']}:00",
             'notes' => $data['notes'] ?? null,
@@ -909,15 +1351,78 @@ class BoardController extends Controller
 
         $wasPublished = $shift->publish_state === PublishState::Published;
 
-        return $this->attempt($request, function () use ($shift, $data, $endDate) {
-            return $this->shifts->update($shift, [
-                'store_id' => $shift->store_id,
-                'employee_id' => $data['employee_id'] ?? null,
-                'position_id' => $data['position_id'] ?? null,
-                'start_at_local' => "{$data['date']} {$data['start']}:00",
-                'end_at_local' => "{$endDate} {$data['end']}:00",
-                'notes' => $data['notes'] ?? null,
-            ]);
+        $attributes = [
+            'store_id' => $shift->store_id,
+            'start_at_local' => "{$data['date']} {$data['start']}:00",
+            'end_at_local' => "{$endDate} {$data['end']}:00",
+        ];
+
+        /**
+         * PRESENT-OR-ABSENT, not `?? null`.
+         *
+         * A key the request did not send means "leave this alone". A key it sent
+         * empty means "clear it". Collapsing the two wiped the POSITION off any
+         * shift edited by a caller that did not resend it — the edit form always
+         * does, which is why it went unnoticed — and a shift with no position
+         * cannot be published at all, because Humanity requires a schedule (its
+         * name for a position) on every shift. It looked like a publish failure
+         * long after the edit that caused it.
+         *
+         * This is the same distinction the JSON API draws with `sometimes`, and
+         * ShiftService::update already honours it: it fills only the keys it is
+         * given.
+         */
+        /*
+         * position_id IS NO LONGER TAKEN FROM THE REQUEST when there is an
+         * employee on the shift. Assigning somebody re-derives their role from
+         * their profile — hiring first, then TCP's assignment, see
+         * plannedPositionId(); clearing the employee leaves whatever the open
+         * slot is for.
+         *
+         * Resolved before the loop below so it participates in the same
+         * present-or-absent contract: a request that says nothing about the
+         * employee changes neither the employee nor the role.
+         */
+        if (array_key_exists('employee_id', $data)) {
+            $employeeId = $data['employee_id'] === null ? null : (int) $data['employee_id'];
+
+            $derived = $employeeId === null
+                ? null
+                : $this->plannedPositionId(
+                    (int) $shift->store_id,
+                    $employeeId,
+                    $data['date'] ?? $this->dateOf($shift->business_date),
+                );
+
+            /*
+             * ONLY WHEN THE PROFILE ACTUALLY HAS AN ANSWER. Writing a null here would
+             * CLEAR the position off the row, and a shift with no position cannot
+             * be published at all — Humanity requires a schedule (its name for a
+             * position) on every one. That is the same fault the present-or-absent
+             * note below was written for, arriving by a new route: it would show
+             * up as a publish failure long after the edit that caused it, at any
+             * store outside TCP or for anybody whose assignments had not synced.
+             *
+             * So a missing profile role leaves the shift's own role alone — the
+             * role it was created with, which is still nobody's guess.
+             */
+            if ($derived !== null) {
+                $data['position_id'] = $derived;
+            } else {
+                // Not ours to change, and not the request's either: the form no
+                // longer offers the field, so anything arriving in it is stale.
+                unset($data['position_id']);
+            }
+        }
+
+        foreach (['employee_id', 'position_id', 'notes'] as $field) {
+            if (array_key_exists($field, $data)) {
+                $attributes[$field] = $data[$field];
+            }
+        }
+
+        return $this->attempt($request, function () use ($shift, $attributes) {
+            return $this->shifts->update($shift, $attributes);
         }, "Shift #{$shift->id} updated locally."
             .($wasPublished
                 ? ' It is already in Humanity, so the next publish run will send the change.'
@@ -938,13 +1443,18 @@ class BoardController extends Controller
         $data = $request->validate([
             'store_id' => ['required', 'integer', 'exists:stores,id'],
             'employee_id' => ['required', 'integer', 'exists:employees,id'],
-            // REQUIRED, unlike everywhere else this column appears. TCP will
-            // not take hours without a jobCodeId and the code says which ROLE
-            // was worked, so a punch saved without a position is one that can
-            // never reach the timeclock — it sits on the board looking recorded
-            // while payroll never sees it. A punch PULLED from TCP always
-            // carries one; only this hand-entry path could omit it.
-            'position_id' => ['required', 'integer', 'exists:positions,id'],
+            /*
+             * NO position_id. It used to be REQUIRED here — TCP will not take
+             * hours without a jobCodeId, and the code says which role was worked
+             * — but requiring it meant asking a manager to name something TCP
+             * already knows, and getting it wrong three different ways: roles
+             * TCP has nowhere, roles it has at one store only, and stores whose
+             * number cannot form a code.
+             *
+             * The role now comes from TCP's own assignment for this person at
+             * this store. See TcpEmployeeJobCode and the migration that
+             * introduced it.
+             */
             'date' => ['required', 'date_format:Y-m-d'],
             'time_in' => ['required', 'date_format:H:i'],
             // A clock-out BEFORE the clock-in is a punch that ran past midnight
@@ -954,12 +1464,17 @@ class BoardController extends Controller
             'notes' => ['nullable', 'string', 'max:2000'],
         ]);
 
-        // A DROPDOWN IS NOT A BOUNDARY. The form only offers positions this
-        // store can file, but a stale page or a hand-rolled POST can still
-        // carry one it cannot, and the result would be a punch that saves and
-        // then fails to sync forever. Refused here, while the manager is still
-        // looking at the form and can pick again.
-        $this->guardPushablePosition((int) $data['store_id'], (int) $data['position_id']);
+        /*
+         * REFUSED WHILE SOMEBODY IS LOOKING AT THE FORM, not at payroll.
+         *
+         * The old guard here asked whether the POSITION a manager picked was one
+         * this store could file. There is no position to pick any more, so the
+         * question became the one that replaced it: has TCP assigned this person
+         * a job code at this store? Without one there is no jobCodeId to send,
+         * and hours that cannot be sent are hours that sit on the board looking
+         * recorded while payroll never sees them.
+         */
+        $this->guardEmployeeHasJobCode((int) $data['store_id'], (int) $data['employee_id']);
 
         $outDate = ($data['time_out'] ?? null) !== null && $data['time_out'] < $data['time_in']
             ? now()->parse($data['date'])->addDay()->toDateString()
@@ -970,7 +1485,14 @@ class BoardController extends Controller
         return $this->attempt($request, fn () => $this->segments->create([
             'store_id' => (int) $data['store_id'],
             'employee_id' => (int) $data['employee_id'],
-            'position_id' => (int) $data['position_id'],
+            // Derived, not submitted. The column stays — the estimator and the
+            // chips read it — but its value is TCP's, not a manager's.
+            //
+            // Null is a real outcome at a store TCP has never heard of, which is
+            // deliberately still allowed to record hours; the punch saves and its
+            // chip says why it cannot be pushed. That is the same behaviour as
+            // before, reached without asking anybody to pick a role first.
+            'position_id' => $this->derivedPositionId((int) $data['store_id'], (int) $data['employee_id']),
             // _local, not the bare column: the form collects store wall clock,
             // and the service converts. Passing time_in here would read 09:30 as
             // UTC and file the punch at the store's offset.
@@ -997,12 +1519,17 @@ class BoardController extends Controller
             'time_in' => ['required', 'date_format:H:i'],
             'time_out' => ['nullable', 'date_format:H:i'],
             'reapprove' => ['nullable', 'boolean'],
-            // THE REPAIR PATH. A punch recorded against a role TCP has no code
-            // for is stuck forever otherwise: the correction dialog only moved
-            // the clocks, so the only way out was to delete evidence of worked
-            // hours and retype it. Optional, so an ordinary time correction is
-            // unchanged.
-            'position_id' => ['nullable', 'integer', 'exists:positions,id'],
+            /*
+             * THE REPAIR PATH IS GONE, because what it repaired cannot happen
+             * any more. It existed so a punch recorded against a role TCP had no
+             * code for could be re-filed without deleting evidence of worked
+             * hours — a dropdown could produce such a punch. The role now comes
+             * from TCP's own assignment, so a punch that saved has a code that
+             * exists, and a correction only ever moves the clocks.
+             *
+             * If TCP moves somebody to a different job code, re-syncing picks it
+             * up and the fix belongs there, not in a dialog on this board.
+             */
         ]);
 
         $outDate = ($data['time_out'] ?? null) !== null && $data['time_out'] <= $data['time_in']
@@ -1011,16 +1538,6 @@ class BoardController extends Controller
 
         $reapprove = (bool) ($data['reapprove'] ?? false);
         $storeId = (int) $segment->store_id;
-
-        if (($data['position_id'] ?? null) !== null && (int) $data['position_id'] !== (int) $segment->position_id) {
-            $this->guardPushablePosition($storeId, (int) $data['position_id']);
-
-            // Written before correctTimes() so the queued push carries it. The
-            // column is scheduling's own, so saveQuietly leaves the sync state
-            // for correctTimes() to set.
-            $segment->forceFill(['position_id' => (int) $data['position_id']])->saveQuietly();
-            $segment->refresh();
-        }
 
         // correctTimes() takes UTC INSTANTS — a bare string is parsed as UTC,
         // not as store-local. The form collects wall-clock time, so it has to
@@ -1124,10 +1641,80 @@ class BoardController extends Controller
         // Saying "shift_id NULL" here would be a lie about what just happened.
         $keptPunches = $shift->workSegments()->count();
 
+        /**
+         * WITHDRAW FROM HUMANITY BEFORE DELETING LOCALLY.
+         *
+         * ShiftService::delete is local only — its own class docblock says
+         * nothing in it talks to Humanity — and nothing else called
+         * SchedulePublisher::withdraw(). So deleting a published shift removed
+         * it from the board and left it live on the employee's roster, with the
+         * row that held its humanity_shift_id soft-deleted, which means nothing
+         * could ever have cleaned it up. Somebody turns up for a shift that was
+         * cancelled a week ago.
+         *
+         * EVERY OCCURRENCE THIS DELETE WILL TAKE, not just the one clicked: a
+         * series delete removes rows for dates the manager never looked at, and
+         * each published one is its own Humanity shift with its own id.
+         */
+        $doomed = $shift->series_id === null
+            ? Shift::query()->whereKey($shift->getKey())->get()
+            : Shift::query()->inSeries(
+                (string) $shift->series_id,
+                $rule === 'following' ? $this->dateOf($shift->business_date) : null,
+            )->get();
+
+        /**
+         * humanity_shift_id, NOT publish_state, and the difference is a bug I
+         * nearly shipped. A row that failed mid-publish keeps its id —
+         * recordFailure() only writes the error — so it is 'failed' AND still
+         * held by Humanity. Filtering on isLive() would skip exactly the shift
+         * whose delete had already been tried once and left behind.
+         *
+         * The id is the only honest test: withdraw() nulls it, so a row that has
+         * one is a row Humanity is holding.
+         */
+        $held = $doomed->filter(fn (Shift $row): bool => $row->humanity_shift_id !== null);
+
         return $this->attempt(
             $request,
-            fn () => $this->shifts->delete($shift, $rule),
+            function () use ($shift, $rule, $held) {
+                /**
+                 * THE GATE BEFORE THE VENDOR CALL, and the order is the whole
+                 * point. ShiftService::delete() refuses a published shift, but
+                 * it runs LAST — so asking it after the withdraw loop would pull
+                 * the shift off the employee's roster and then refuse to delete
+                 * it here, leaving the two systems disagreeing in the one
+                 * direction that matters.
+                 *
+                 * Same rule, same class, just asked early enough to be useful.
+                 */
+                $this->shifts->assertCanDelete($shift);
+
+                /**
+                 * Humanity first, and the local delete is abandoned if it fails.
+                 *
+                 * The other order loses the shift off the board while the vendor
+                 * keeps it — and once the row is gone there is nothing left to
+                 * retry with. Refusing leaves the manager a shift they can try
+                 * to cancel again, which is the recoverable half of the trade.
+                 *
+                 * A partial sweep is recoverable too: occurrences already
+                 * withdrawn are Unpublished and still on the board, so pressing
+                 * delete again finishes the job.
+                 */
+                foreach ($held as $row) {
+                    // No rule passed: we never send `repeat` on a create, so each
+                    // Humanity shift stands alone and the vendor's own series
+                    // rule has nothing to act on.
+                    $this->publisher->withdraw($row);
+                }
+
+                return $this->shifts->delete($shift, $rule);
+            },
             "Shift #{$shift->id} soft-deleted (rule: {$rule})."
+                .($held->isNotEmpty()
+                    ? ' '.$held->count().' shift(s) withdrawn from Humanity, so nobody is still rostered for it.'
+                    : ' Humanity was not holding it, so nothing was sent.')
                 .($keptPunches > 0
                     ? " Its {$keptPunches} punch(es) still reference it, so the pairing survives a restore."
                     : ''),

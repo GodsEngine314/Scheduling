@@ -33,6 +33,13 @@ class TcpClient extends AbstractApiClient
     private const JOB_CODES_PATH = '/jobcodes';
 
     /**
+     * WHICH PEOPLE HOLD WHICH CODES. Undocumented — neither /employees nor
+     * /jobcodes carries the assignment, and /employees/{id}/jobcodes answers
+     * 403. This spelling was found by probing and confirmed against live data.
+     */
+    private const EMPLOYEE_JOB_CODES_PATH = '/employeejobcodes';
+
+    /**
      * Pagination circuit breaker. At the configured page size this is far more
      * segments than any real filter can produce, so tripping it means the
      * vendor is ignoring our page parameter and serving page 1 forever. Better
@@ -217,6 +224,45 @@ class TcpClient extends AbstractApiClient
             }
 
             $page++;
+        }
+
+        return $records;
+    }
+
+    /**
+     * The job codes TCP has assigned to these people.
+     *
+     * THE LOOKUP THAT REPLACED A DROPDOWN. A punch needs a jobCodeId, and it
+     * used to be assembled from a position a manager picked — franchise + store
+     * + role, on the hope that TCP had that combination. It frequently did not.
+     * This is TCP's own answer to the same question, and its timeclock files
+     * hours against exactly these assignments.
+     *
+     * TWO KINDS OF ROW COME BACK TOGETHER and only their shape separates them:
+     *
+     *     37951001   "Crew Member - 3795-10"    a per-store ROLE, 8 digits
+     *     1003       "Bonus"                    a company-wide PAY CATEGORY
+     *
+     * Both are returned here unfiltered; deciding which may be sent as a punch's
+     * job code is TcpEmployeeJobCodeReader's job, and it is a distinction worth
+     * making explicitly rather than inside a client.
+     *
+     * SCOPED BY PEOPLE, not by store, because that is the only filter the
+     * endpoint takes — and the 20-value cap applies here as everywhere else, so
+     * the filter is chunked. A store's roster is turned into ids by the caller.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    public function employeeJobCodes(EmployeeFilter $filter): array
+    {
+        $perPage = $this->pageSize();
+        $records = [];
+
+        foreach ($filter->chunked() as $chunk) {
+            $records = array_merge(
+                $records,
+                $this->paginate(self::EMPLOYEE_JOB_CODES_PATH, $chunk->withPerPage($perPage)),
+            );
         }
 
         return $records;

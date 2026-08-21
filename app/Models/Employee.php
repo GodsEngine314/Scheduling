@@ -96,6 +96,40 @@ class Employee extends Model
         return $query->where('primary_store_id', $storeId);
     }
 
+    /**
+     * The role HIRING says this person holds, on a given date.
+     *
+     * WHERE A ROLE ACTUALLY COMES FROM. Scheduling used to ask a manager to pick
+     * one per shift, which made the same fact answerable three different ways
+     * for the same person on the same day. It is not scheduling's fact: hiring
+     * owns who somebody is employed as, publishes it on
+     * hiring.v1.employee.created|updated, and is where a promotion is recorded.
+     * This service reads it and never writes it — a change belongs in hiring,
+     * and the next event would overwrite anything written here anyway.
+     *
+     * EFFECTIVE-DATED, not current: employee_positions is history, so a shift
+     * next month after a promotion gets the new role and last month's shifts
+     * keep the old one. primary_position_id is the fallback the projection
+     * carries for people whose history has not arrived — the board default, as
+     * this class's own docblock says.
+     *
+     * Null is a real answer and means hiring has said nothing about this person
+     * yet. It is not an invitation to guess: see BoardController's
+     * plannedPositionId(), which asks TCP next and then stops.
+     */
+    public function positionIdOn(?string $date = null): ?int
+    {
+        $date ??= now()->toDateString();
+
+        $historical = $this->positions()->effectiveOn($date)->value('position_id');
+
+        if ($historical !== null) {
+            return (int) $historical;
+        }
+
+        return $this->primary_position_id === null ? null : (int) $this->primary_position_id;
+    }
+
     public function fullName(): string
     {
         return trim(implode(' ', array_filter([

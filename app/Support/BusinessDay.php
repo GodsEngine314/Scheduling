@@ -20,6 +20,23 @@ use Throwable;
  * events do not carry a timezone, so it cannot live on the stores projection.
  * A store with no settings row falls back to DEFAULT_TIMEZONE rather than
  * failing: a store that exists must still be schedulable on day one.
+ *
+ * PER STORE, NOT PER EMPLOYEE, and that is a decision rather than an oversight.
+ * TCP turns out to carry a zone on each employee record —
+ *
+ *     "timezone": {"timeZoneId": "America/New_York", "description": "..."}
+ *
+ * — so projecting it and rendering each person's rows on their own clock is
+ * available and was considered. It is not done, because a punch happens AT A
+ * STORE: the wall clock that matters for "who was on at 17:00" is the one on the
+ * wall of the building, and two people's punches on one board reading on
+ * different clocks would make a headcount row impossible to total. The estate
+ * spans five zones (New_York, Detroit, Chicago, Denver, Indiana/Indianapolis,
+ * Kentucky/Louisville) and every store carries the right one.
+ *
+ * If a per-employee zone is ever wanted — a remote worker, or somebody's own
+ * view of their shifts — it belongs beside this method as a second lookup, not
+ * as a replacement for it.
  */
 class BusinessDay
 {

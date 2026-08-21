@@ -126,7 +126,7 @@ it('voids the fingerprint when an unlocked shift is moved, keeping its Humanity 
         'payload_fingerprint' => str_repeat('c', 64),
     ])->save();
 
-    $this->post("/board/shifts/{$shift->id}/unpublish")->assertRedirect();
+    unpublishViaBoard($shift)->assertRedirect();
     $this->postJson("/board/shifts/{$shift->id}/move", ['business_date' => $this->tomorrow])->assertOk();
 
     $fresh = $shift->fresh();

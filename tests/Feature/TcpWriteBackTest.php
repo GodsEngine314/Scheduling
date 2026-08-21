@@ -101,7 +101,11 @@ it('queues a TCP push when times are corrected', function () {
 
 it('queues a TCP push when a segment is created for someone who forgot to clock in', function () {
     Queue::fake();
-    $employee = Employee::firstOrFail();
+
+    // Somebody the demo has NOT already punched for. The first employee is Ada,
+    // whose seeded punch runs 10:58-14:02 — so a 09:00-12:00 hand entry for her
+    // is a genuine overlap and is now refused. This test is about the TCP push.
+    $employee = Employee::query()->whereDoesntHave('workSegments')->orderBy('id')->firstOrFail();
 
     app(WorkSegmentService::class)->create([
         'store_id' => DemoSeeder::STORE_ID,
@@ -397,7 +401,7 @@ it('refuses to edit a published shift, then re-sends it as a PUT once unpublishe
 
     // Unpublishing keeps the shift in Humanity AND keeps its id — that is what
     // makes the next publish a PUT instead of a duplicate POST.
-    $this->post("/board/shifts/{$shift->id}/unpublish")->assertRedirect();
+    unpublishViaBoard($shift)->assertRedirect();
 
     expect($shift->fresh()->publish_state->value)->toBe('unlocked')
         ->and($shift->fresh()->humanity_shift_id)->toBe('HS-9');

@@ -118,6 +118,45 @@ class IntegrationException extends RuntimeException
      * We never left the building: a missing client secret, an auth mode nobody
      * implements. Retrying cannot fix a config file.
      */
+    /**
+     * The vendor rejected the credentials themselves.
+     *
+     * A SEPARATE FACTORY because of where this message ends up: on
+     * shifts.last_publish_error, which is what a manager reads on the board when
+     * a publish run comes back red. "humanity POST .../oauth2/token.php failed
+     * with HTTP 401" is true and useless — it looks like a bug in the schedule.
+     * This says whose problem it is and that nothing was sent.
+     *
+     * NOT transient. A credential that is wrong now is wrong in five minutes,
+     * and retrying a rejected login is how an account gets locked.
+     *
+     * The response body is deliberately absent: a token endpoint's error can
+     * quote the credentials it just refused.
+     */
+    public static function credentialsRejected(
+        string $integration,
+        string $endpoint,
+        int $status,
+        string $correlationId,
+    ): self {
+        return new static(
+            $integration,
+            'POST',
+            $endpoint,
+            $status,
+            $correlationId,
+            false,
+            sprintf(
+                '%s rejected the credentials (HTTP %d from the token endpoint), so NOTHING was sent. '
+                .'Check %s.oauth.username and .password in .env — and whether that account signs in through '
+                .'SSO, which refuses the password grant even when the password is right.',
+                ucfirst($integration),
+                $status,
+                $integration,
+            ),
+        );
+    }
+
     public static function configuration(string $integration, string $message): self
     {
         return new static(

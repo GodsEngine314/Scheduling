@@ -1,5 +1,6 @@
 <?php
 
+use App\Models\Shift;
 use App\Models\User;
 use App\Services\Auth\TokenIntrospection;
 use App\Services\Auth\TokenIntrospector;
@@ -105,4 +106,29 @@ function signIn(array $roles = ['super-admin'], array $permissions = [], ?int $u
     // asks anything. The header works for the API and the console alike, which
     // is why it is used rather than seeding a session.
     test()->withHeader('Authorization', 'Bearer test-token');
+}
+
+/**
+ * Unpublish through the console, which is now a RANGE control.
+ *
+ * The per-shift POST /board/shifts/{id}/unpublish is gone: unpublishing serves
+ * "unlock the week, change it, republish", so doing it a chip at a time meant a
+ * manager clicking fourteen padlocks before they could touch anything.
+ *
+ * SCOPED TO THE SHIFT'S OWN BUSINESS DATE, so every caller here keeps the
+ * meaning it had — "unlock this one shift" — rather than quietly unlocking a
+ * whole week and passing for the same test. That matters most in the series
+ * tests, where the siblings sit on other days and must stay locked.
+ */
+function unpublishViaBoard(Shift $shift)
+{
+    $date = $shift->business_date instanceof DateTimeInterface
+        ? $shift->business_date->format('Y-m-d')
+        : (string) $shift->business_date;
+
+    return test()->post(route('board.shifts.unpublish-all'), [
+        'store_id' => $shift->store_id,
+        'from' => $date,
+        'to' => $date,
+    ]);
 }

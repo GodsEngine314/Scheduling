@@ -4,6 +4,7 @@ namespace App\Services\Scheduling;
 
 use App\Enums\TcpSyncState;
 use App\Exceptions\IntegrationException;
+use App\Models\TcpEmployeeJobCode;
 use App\Models\TcpJobCodeRole;
 use App\Models\WorkSegment;
 use App\Support\BusinessDay;
@@ -78,7 +79,8 @@ class TcpWorkSegmentWriter
         // back 400 "The jobCodeId must have a value." — a round trip spent to
         // be told something we already knew, landing in tcp_sync_error as a
         // vendor complaint about a field no manager has heard of rather than as
-        // the thing they can actually fix: this punch has no position on it.
+        // the thing they can actually fix: TCP has assigned this person no job
+        // code at this store.
         //
         // ON THE CREATE PATH ONLY, and the asymmetry is deliberate. The 400 is
         // confirmed for POST and NOTHING IS KNOWN ABOUT PUT. Guarding updates
@@ -86,10 +88,7 @@ class TcpWorkSegmentWriter
         // is an update, the day close is gated on approvals, and refusing them
         // at a store whose number cannot form a code would take that store's
         // close down for a field TCP may not even want here.
-        if (TcpJobCodeRole::jobCodeIdFor(
-            $segment->store?->store_number,
-            $segment->position_id === null ? null : (int) $segment->position_id,
-        ) === null) {
+        if ($this->jobCodeFor($segment) === null) {
             throw IntegrationException::guard(
                 'tcp',
                 'POST /worksegments',
@@ -131,39 +130,83 @@ class TcpWorkSegmentWriter
     }
 
     /**
-     * WHY this punch has no job code, in terms the person who made it can act
-     * on.
+     * The job code to file these hours under.
      *
-     * Three genuinely different faults reach the same dead end, and telling
-     * them apart is the difference between a fixable message and a shrug:
+     * THE EMPLOYEE'S OWN ASSIGNMENT FIRST, which is the whole point of the
+     * change that removed the position dropdown. TCP assigns codes to people —
+     * GET /employeejobcodes — and its own timeclock files hours against exactly
+     * those assignments. Reading one is a lookup; building one from a picked
+     * position was a guess about whether the vendor had that combination, and
+     * across the estate it frequently did not.
      *
-     *   no position          pick one — the commonest, since the hand-entry
-     *                        form lets a punch be saved without one
-     *   position unmapped    Driver and Insider are ours, not TCP's; no job
-     *                        code anywhere corresponds to them
-     *   role not at store    Management exists at exactly one store in the
-     *                        estate, so it cannot be worked at the others
+     * THE FALLBACK IS FOR ONE CASE ONLY: an employee whose assignments have not
+     * been synced yet. It reconstructs franchise+store+role from the position on
+     * the punch, exactly as before, and is checked against the live catalogue,
+     * so it can still only produce a code TCP is known to have. Kept rather than
+     * deleted because the alternative — refusing to push a punch because a
+     * background sync has not run — would lose real hours to a cache miss.
+     *
+     * Store-scoped on both paths. A code names ONE store, so a cover shift filed
+     * under the home store's code books the hours to the wrong store's labour.
+     */
+    private function jobCodeFor(WorkSegment $segment): ?string
+    {
+        $storeNumber = $segment->store?->store_number;
+
+        $assigned = TcpEmployeeJobCode::jobCodeIdFor(
+            $segment->employee_id === null ? null : (int) $segment->employee_id,
+            $storeNumber,
+        );
+
+        if ($assigned !== null) {
+            return $assigned;
+        }
+
+        return TcpJobCodeRole::jobCodeIdFor(
+            $storeNumber,
+            $segment->position_id === null ? null : (int) $segment->position_id,
+        );
+    }
+
+    /**
+     * WHY these hours have no job code, in terms the person who made them can
+     * act on.
+     *
+     * REWRITTEN WHEN THE DROPDOWN WENT. Every message here used to be about a
+     * position somebody had picked — "that role is not a TCP role", "pick one" —
+     * and none of those are the fault any more, because nobody picks anything.
+     * The code comes from TCP's own assignment for this person at this store, so
+     * the three ways it can be missing are all about the assignment:
+     *
+     *   nobody on the punch      there is no person to hold a code
+     *   store not in TCP         its number cannot form a code at all
+     *   person has no code here  the actionable one, and the commonest: TCP has
+     *                            not assigned them a role at THIS store
+     *
+     * The last is a real operational state, not a bug: somebody covering a shift
+     * at a store they are not set up at. It is fixed in TCP, by whoever assigns
+     * job codes, and naming the person and the store is what makes that possible
+     * from this screen.
      */
     private function explainMissingJobCode(WorkSegment $segment): string
     {
         $storeNumber = $segment->store?->store_number;
 
-        if ($segment->position_id === null) {
-            return 'This punch has no position on it, and TCP will not take hours without one — the job code it requires says which role was worked.';
+        if ($segment->employee === null) {
+            return 'This punch has no employee on it, so there is nobody whose TCP job code could file it.';
         }
+
+        $who = $segment->employee->fullName();
 
         if (TcpJobCodeRole::storeKeyFor($storeNumber) === null) {
-            return 'Store '.($storeNumber ?? 'unknown').' has no TCP job codes, because its store number is not in the franchise-store form (03795-00010) that a job code is built from.';
+            return 'Store '.($storeNumber ?? 'unknown').' has no TCP job codes, because its store number is not in the '
+                .'franchise-store form (03795-00010) that a job code is built from. Nothing can be filed there until '
+                .'the store number is corrected.';
         }
 
-        $label = $segment->position?->label ?? 'That position';
-
-        if (! TcpJobCodeRole::query()->where('position_id', $segment->position_id)->exists()) {
-            return $label.' is not a TCP role, so no job code corresponds to it. Use one of the positions TCP knows about.';
-        }
-
-        return 'TCP has no '.$label.' job code at store '.($storeNumber ?? 'unknown')
-            .'. That role exists at some stores and not others, so the hours cannot be filed under it here.';
+        return 'TCP has no job code assigned to '.$who.' at store '.($storeNumber ?? 'unknown').', so it cannot be '
+            .'told what role these hours were worked as. Assign them a job code at that store in TCP — the board picks '
+            .'it up within the hour, or immediately if you switch stores and back.';
     }
 
     /** @return array<mixed> */
@@ -226,12 +269,11 @@ class TcpWorkSegmentWriter
             'employeeRecordId' => $identity['external_record_id'] ?? null,
             // CONFIRMED BY THE VENDOR, unlike its neighbours: a POST without
             // this comes back 400 "The jobCodeId must have a value." It encodes
-            // franchise, store and role in one number, so it is derived from
-            // both the segment's store and its position rather than stored.
-            'jobCodeId' => TcpJobCodeRole::jobCodeIdFor(
-                $segment->store?->store_number,
-                $segment->position_id === null ? null : (int) $segment->position_id,
-            ),
+            // franchise, store and role in one number, and it is TCP's OWN
+            // assignment for this person at this store — see jobCodeFor(), and
+            // the migration for tcp_employee_job_codes for why that replaced
+            // asking a manager to pick a position.
+            'jobCodeId' => $this->jobCodeFor($segment),
             'timeIn' => $this->wireTime($segment, $segment->time_in),
             'breakTime' => $segment->break_minutes ?: null,
             'costCodeName' => $segment->cost_code_name,

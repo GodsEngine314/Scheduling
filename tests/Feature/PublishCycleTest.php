@@ -1,6 +1,7 @@
 <?php
 
 use App\Models\Employee;
+use App\Models\HumanitySchedule;
 use App\Models\IntegrationIdentity;
 use App\Models\Shift;
 use App\Models\WorkSegment;
@@ -55,6 +56,23 @@ beforeEach(function () {
             'system' => 'humanity',
             'external_id' => 'HE-'.$id,
             'sync_state' => 'synced',
+        ]);
+    }
+
+    // And every store/position pair needs a Humanity schedule, for the same
+    // reason: `schedule` is REQUIRED on POST /shifts, so a shift the catalogue
+    // has no entry for is refused before a request is ever made.
+    $pairs = Shift::query()
+        ->whereNotNull('position_id')
+        ->get(['store_id', 'position_id'])
+        ->unique(fn (Shift $shift): string => $shift->store_id.':'.$shift->position_id);
+
+    foreach ($pairs as $shift) {
+        HumanitySchedule::create([
+            'schedule_id' => "HSCH-{$shift->store_id}-{$shift->position_id}",
+            'store_id' => $shift->store_id,
+            'position_id' => $shift->position_id,
+            'name' => 'Fixture',
         ]);
     }
 
@@ -230,9 +248,25 @@ it('does not create or update a planned shift when actual hours are pulled', fun
 it('offers both directions on the board, labelled for the right system', function () {
     $response = $this->get('/board?store='.DemoSeeder::STORE_ID)->assertOk();
 
-    $response->assertSee('Publish this day')          // out, to Humanity
-        ->assertSee('Pull actual hours from TCP')     // in, from TCP
-        ->assertSee('GET /worksegments', false);
+    /*
+     * BOTH DIRECTIONS ARE STILL ON THE SCREEN — but they are no longer the same
+     * KIND of thing, and that asymmetry is the point of this assertion.
+     *
+     * OUT is a decision. A plan reaches Humanity when somebody decides it is
+     * ready, and it stays a button because nobody should publish a roster by
+     * accident.
+     *
+     * IN is a fact. A punch happened; there is nothing to decide, so there is
+     * nothing to press. The board polls TCP on its own — see LiveSegmentFeed —
+     * and the card says so and shows when it last checked.
+     */
+    $response->assertSee('Publish this day')     // out, to Humanity: a decision
+        ->assertSee('live-card', false)          // in, from TCP: automatic
+        ->assertSee(route('board.live'), false)
+        // The button is gone on purpose. Its own docblock said a store nobody
+        // pressed it for showed an empty grid indistinguishable from "nobody
+        // worked", which is not a thing a button can fix.
+        ->assertDontSee('Pull actual hours from TCP');
 });
 
 // ── nothing leaves until publish ────────────────────────────────────────
@@ -300,7 +334,7 @@ it('sends a PUT over the same Humanity shift after unpublish and edit', function
     expect($humanityId)->not->toBeNull();
 
     // Unpublish, edit, re-publish.
-    $this->post("/board/shifts/{$shift->id}/unpublish")->assertRedirect();
+    unpublishViaBoard($shift)->assertRedirect();
     $this->put("/board/shifts/{$shift->id}", [
         'date' => $this->today,
         'employee_id' => $shift->employee_id,
@@ -331,7 +365,7 @@ it('leaves the shift in Humanity when it is unpublished', function () {
     ])->assertRedirect();
 
     fakeHumanity();
-    $this->post("/board/shifts/{$shift->id}/unpublish")->assertRedirect();
+    unpublishViaBoard($shift)->assertRedirect();
 
     // Unpublish is a LOCAL unlock. Employees keep seeing the last published
     // version rather than watching a shift vanish mid-edit.
@@ -347,7 +381,7 @@ it('reports unchanged rather than re-sending when nothing was edited after unpub
     $shift = publishableShift();
     $payload = ['store_id' => DemoSeeder::STORE_ID, 'from' => $this->today, 'to' => $this->today];
     $this->post('/board/publish', $payload)->assertRedirect();
-    $this->post("/board/shifts/{$shift->id}/unpublish")->assertRedirect();
+    unpublishViaBoard($shift)->assertRedirect();
 
     fakeHumanity();
     $this->post('/board/publish', $payload)->assertRedirect();
@@ -361,13 +395,43 @@ it('reports unchanged rather than re-sending when nothing was edited after unpub
         ->and(session('ok'))->toContain('unchanged');
 });
 
-it('refuses to unpublish something that was never published', function () {
+it('says there is nothing to unpublish rather than refusing, now that it is a range action', function () {
+    /*
+     * THE SEMANTICS CHANGED WITH THE GRAIN, deliberately.
+     *
+     * Per shift, "unpublish this draft" was a mistake worth refusing: the
+     * manager had pressed a padlock on something that had none. Per RANGE it is
+     * not a mistake at all — "unlock this week" over a week with nothing locked
+     * is a no-op somebody may reasonably press, and answering an error would
+     * teach them to distrust the button.
+     *
+     * The state is what still has to be untouched, and it is.
+     */
     $draft = publishableShift();
 
-    $this->post("/board/shifts/{$draft->id}/unpublish")->assertRedirect();
+    unpublishViaBoard($draft)->assertRedirect();
 
-    expect(session('err'))->toContain('nothing to unpublish')
+    expect(session('ok'))->toContain('Nothing to unpublish')
         ->and($draft->fresh()->publish_state->value)->toBe('draft');
+});
+
+it('is idempotent, so pressing unpublish twice is not an error', function () {
+    fakeHumanity();
+
+    $shift = publishableShift();
+    $this->publisher->push($shift);
+
+    unpublishViaBoard($shift->fresh())->assertRedirect();
+    expect($shift->fresh()->publish_state->value)->toBe('unlocked');
+
+    // A range control gets pressed again. The second press finds nothing locked
+    // and says so, and must not undo the first.
+    unpublishViaBoard($shift->fresh())->assertRedirect();
+
+    expect(session('ok'))->toContain('Nothing to unpublish')
+        ->and($shift->fresh()->publish_state->value)->toBe('unlocked')
+        // The id survives, which is what makes the next publish a PUT.
+        ->and($shift->fresh()->humanity_shift_id)->not->toBeNull();
 });
 
 // ── the API surface agrees with the board ───────────────────────────────

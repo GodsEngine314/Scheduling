@@ -141,10 +141,47 @@ class ShiftService
      *
      * A shift with no series_id ignores the rule and deletes only itself.
      *
+     * PUBLISHED SHIFTS ARE REFUSED. Unpublish it first.
+     *
+     * This reverses an earlier decision, which is worth saying plainly rather
+     * than quietly rewriting. Delete used to be the one ungated path, on the
+     * reasoning that cancelling a shift is urgent and two steps would be
+     * friction in the wrong place. The rule now asked for is the symmetric one:
+     * anything that changes a shift Humanity is holding — edit, move, or cancel
+     * — goes unpublish, change, republish.
+     *
+     * What that buys is a single mental model, and one thing it genuinely fixes:
+     * unpublish is local and free, so a manager who unpublishes and then thinks
+     * better of the cancellation has spent nothing. Under the old rule the DELETE
+     * had already gone to Humanity and the shift had already vanished from
+     * somebody's phone.
+     *
+     * The cost, and it is real: cancelling a shift now takes two clicks instead
+     * of one, on the path where a manager is usually in a hurry.
+     *
      * @return int rows soft-deleted
      */
+    /**
+     * The delete gate, on its own, for a caller that has work to do FIRST.
+     *
+     * BoardController withdraws the shift from Humanity before deleting it
+     * locally, and it must not do that for a shift the delete is going to refuse
+     * anyway — that would take the shift off the employee's roster and then
+     * leave it sitting on the board, which is the worst of both. So the gate is
+     * callable ahead of the vendor round trip, and delete() still applies it
+     * itself for every other caller.
+     *
+     * @throws SchedulingException
+     */
+    public function assertCanDelete(Shift $shift): void
+    {
+        $this->refuseIfLocked($shift, 'deleted');
+    }
+
     public function delete(Shift $shift, string $rule = 'following'): int
     {
+        $this->assertCanDelete($shift);
+
         if (! in_array($rule, ['following', 'all'], true)) {
             throw new SchedulingException(
                 "Unknown delete rule '{$rule}'. Expected 'following' or 'all'.",
@@ -344,10 +381,8 @@ class ShiftService
      * as that takes. Making the manager unpublish first turns that into a
      * deliberate act.
      *
-     * Delete is deliberately NOT gated: cancelling a shift is urgent, it sends
-     * its own DELETE to Humanity, and requiring two steps to call one off would
-     * be friction in exactly the wrong place. Copy is not gated either — it
-     * produces a fresh draft and leaves the published row alone.
+     * DELETE IS GATED TOO, as of the symmetric rule — see delete(). Copy is
+     * not: it produces a fresh draft and leaves the published row alone.
      */
     private function refuseIfLocked(Shift $shift, string $verb): void
     {

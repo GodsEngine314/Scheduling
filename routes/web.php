@@ -45,14 +45,47 @@ Route::middleware('auth.service')->group(function (): void {
     // Drag and drop targets. JSON in, JSON out — the grid posts and reloads.
     Route::post('/board/shifts/{shift}/move', [BoardController::class, 'moveShift'])->name('board.shifts.move');
     Route::post('/board/shifts/{shift}/copy', [BoardController::class, 'copyShift'])->name('board.shifts.copy');
+    /*
+     * THE BOARD'S HEARTBEAT, and the reason there is no longer a pull button.
+     *
+     * The page polls this; it answers "has anything changed?" and refreshes the
+     * visible range from TCP while it is in there. TCP has no webhook, so this
+     * is as close to push as the vendor allows — see LiveSegmentFeed.
+     *
+     * GET on purpose. It writes nothing of ours; it reads the vendor into a
+     * table that mirrors the vendor.
+     */
+    Route::get('/board/live', [BoardController::class, 'live'])->name('board.live');
+
     // Pull ACTUAL hours from TCP. The other half of the split: planned shifts go
     // out to Humanity, worked hours come in from TCP. Neither crosses over.
+    //
+    // NO LONGER ON ANY SCREEN — board.live above is what keeps a board current.
+    // Kept as the explicit "fetch this range now" call for operators and tests,
+    // which is the same thing the button used to do.
     Route::post('/board/pull-segments', [BoardController::class, 'pullSegments'])->name('board.pull-segments');
 
-    // Publish the visible range to Humanity, and unlock one shift for editing.
-    // Nothing reaches Humanity until the first of these is pressed.
+    /*
+     * THE THREE RANGE ACTIONS. All take the store and the span the board is
+     * showing, and all agree about what "in view" means — see
+     * BoardController::validateRange().
+     *
+     * publish          drafts and edits OUT to Humanity. Live on landing.
+     * unpublish-all    unlock the range for editing. LOCAL — Humanity keeps the
+     *                  shifts, and the next publish sends PUTs over them.
+     * destroy-all      withdraw from Humanity, then soft-delete the range.
+     *
+     * Nothing reaches Humanity until publish is pressed.
+     */
     Route::post('/board/publish', [BoardController::class, 'publish'])->name('board.publish');
-    Route::post('/board/shifts/{shift}/unpublish', [BoardController::class, 'unpublishShift'])->name('board.shifts.unpublish');
+
+    // Was one padlock per chip. The rule is unchanged; the grain was wrong —
+    // "unpublish, change the week, republish" is a week-sized workflow.
+    Route::post('/board/shifts/unpublish-all', [BoardController::class, 'unpublishShifts'])->name('board.shifts.unpublish-all');
+
+    // DELETE on the collection, not on a member. Scoped to the visible range,
+    // never the table — see ShiftRangeService.
+    Route::delete('/board/shifts', [BoardController::class, 'destroyShifts'])->name('board.shifts.destroy-all');
 
     Route::post('/board/shifts/{shift}/punch-in', [BoardController::class, 'punchIn'])->name('board.shifts.punch-in');
     Route::delete('/board/shifts/{shift}', [BoardController::class, 'destroyShift'])->name('board.shifts.destroy');

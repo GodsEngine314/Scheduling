@@ -189,25 +189,17 @@
     </div>
 
     {{-- The other direction. Planned shifts go OUT to Humanity; worked hours
-         come IN from TCP, and neither crosses over. --}}
-    <div class="card pad grow" style="border-left:4px solid var(--actual)">
-      <div class="lbl">TCP</div>
-      <div style="font-family:var(--mono);font-weight:700;font-size:13px;color:var(--actual)">
-        {{ $segments->count() }} punch{{ $segments->count() === 1 ? '' : 'es' }} this week
-      </div>
-      <p class="note" style="margin:2px 0 8px">
-        One request for the whole week. Re-pulling is free: the upsert is keyed on
-        <code>tcp_segment_id</code>, and a row somebody has approved or corrected is held
-        rather than overwritten.
-      </p>
-      <form method="POST" action="{{ route('board.pull-segments') }}" class="inline">
-        @csrf
-        <input type="hidden" name="store_id" value="{{ $storeId }}">
-        <input type="hidden" name="date" value="{{ $days[0] }}">
-        <input type="hidden" name="to" value="{{ $days[6] }}">
-        <button class="primary">Pull the week's actual hours</button>
-      </form>
-    </div>
+         come IN from TCP, and neither crosses over.
+
+         There is no pull button any more: the week keeps itself current. See
+         board/_live.blade.php. --}}
+    @include('board._live', [
+        'storeId' => $storeId,
+        'from' => $days[0],
+        'to' => $days[6],
+        'live' => $live,
+        'headline' => $segments->count().' punch'.($segments->count() === 1 ? '' : 'es').' this week',
+    ])
 
     <div class="card pad stat" style="border-left:4px solid {{ $actuals['unapproved'] > 0 || $actuals['open_punches'] > 0 ? 'var(--warn)' : 'var(--line-2)' }}">
       <div class="lbl">Outstanding</div>
@@ -239,7 +231,17 @@
 
     @include('board._publish', [
         'storeId' => $storeId, 'from' => $days[0], 'to' => $days[6],
-        'publishable' => $publishable, 'label' => 'this week',
+        'publishable' => $publishable, 'republishable' => $republishable, 'range' => $range, 'label' => 'this week',
+    ])
+
+    {{-- The counterpart controls, and both are week-sized on purpose — see
+         board/_range-actions.blade.php. --}}
+    @include('board._range-actions', [
+        'storeId' => $storeId,
+        'from' => $days[0],
+        'to' => $days[6],
+        'label' => 'this week',
+        'range' => $range,
     ])
 
     <div class="card pad stat">
@@ -267,26 +269,14 @@
           @endforeach
         </select>
       </label>
+      {{-- NO POSITION FIELD. The role comes from TCP's own job code assignment
+           for this person at this store, shown on the option itself — see
+           board/_employee-options.blade.php. Somebody TCP has assigned no code
+           cannot have hours filed at all, so their option is disabled rather
+           than accepted and rejected later. --}}
       <label class="f"><span class="lbl">Employee</span>
         <select name="employee_id" required>
-          @foreach ($roster as $r)
-            <option value="{{ $r['model']->id }}">{{ $r['model']->fullName() }}</option>
-          @endforeach
-        </select>
-      </label>
-      {{-- No "none" here, unlike the planned-shift form below. TCP requires a
-           jobCodeId on every punch and the code encodes the ROLE, so hours
-           saved without a position can never reach the timeclock — they would
-           sit on this board looking recorded while payroll never saw them. --}}
-      {{-- ONLY WHAT THIS STORE CAN FILE. Driver, Insider and Shift Lead have
-           no TCP job code anywhere, and Management has one at a single store,
-           so offering the full list produced punches that saved cleanly, showed
-           on the board and could never be pushed. --}}
-      <label class="f"><span class="lbl">Position</span>
-        <select name="position_id" required>
-          @foreach ($filable as $p)
-            <option value="{{ $p->id }}">{{ $p->label }}</option>
-          @endforeach
+          @include('board._employee-options', ['for' => 'punch'])
         </select>
       </label>
       <label class="f"><span class="lbl">Clocked in</span><input type="time" name="time_in" value="17:00" required></label>
@@ -300,14 +290,16 @@
       leaves visible hours rather than losing them — and it arrives unapproved.
     </p>
     @unless ($storeInTcp)
-      {{-- The positions above are the ESTATE's roles, not this store's — TCP has
-           no job codes for it, so the hours will record and then sit unpushed
-           with the reason on the chip. Better said here than discovered there. --}}
+      {{-- REWORDED WHEN THE POSITION FIELD WENT. It used to explain that the
+           roles on offer were the estate's rather than this store's. There are no
+           roles on offer any more — nobody is offered anything — so the thing
+           worth saying is what will happen to the hours. Said here rather than
+           discovered on a chip afterwards. --}}
       <p class="note" style="margin-top:6px;color:var(--warn)">
         TCP has no job codes for store
-        {{ $stores->firstWhere('id', $storeId)?->store_number ?? $storeId }}, so these are
-        the roles it uses elsewhere. Hours recorded here save and show on the board,
-        but nothing can be filed at the timeclock until the store is mapped.
+        {{ $stores->firstWhere('id', $storeId)?->store_number ?? $storeId }}, so nobody here
+        has a job code to file hours against. Hours recorded now save and show on the
+        board, and nothing can reach the timeclock until the store is mapped.
       </p>
     @endunless
   </div>
@@ -328,19 +320,24 @@
         </select>
       </label>
       <label class="f"><span class="lbl">Employee</span>
-        <select name="employee_id">
+        <select name="employee_id" class="js-open-shift-toggle">
           <option value="">— open shift —</option>
-          @foreach ($roster as $r)
-            <option value="{{ $r['model']->id }}">{{ $r['model']->fullName() }}</option>
-          @endforeach
+          @include('board._employee-options')
         </select>
       </label>
-      {{-- FILTERED THE SAME WAY THE HOURS FORM IS, which it did not used to be.
-           A plan goes to Humanity and needs no job code, so the full table was
-           defensible here in isolation — but rostering a Driver books a shift
-           whose hours TCP will refuse the moment somebody works it, and that
-           refusal surfaces at payroll rather than on this screen. --}}
-      <label class="f"><span class="lbl">Position</span>
+      {{-- THE ONE POSITION FIELD LEFT ON THE CONSOLE, and only for a slot with
+           nobody in it.
+
+           When there is a person on the shift the role is theirs and comes from
+           TCP, so the field is hidden and the server ignores it. When there is
+           not, there is nobody to inherit from and the role IS the shift's whole
+           content — "we need a Driver on Friday" is the point of an open slot,
+           and Humanity refuses a shift carrying no position at all.
+
+           Still filtered to roles TCP can file: rostering a slot as Driver books
+           a shift whose hours are refused the moment somebody works it, and that
+           refusal surfaces at payroll rather than here. --}}
+      <label class="f js-open-shift-only"><span class="lbl">Position (open slot)</span>
         <select name="position_id">
           @foreach ($filable as $p)<option value="{{ $p->id }}">{{ $p->label }}</option>@endforeach
         </select>
@@ -799,13 +796,13 @@
            Listed the same way the entry form is: only what this store can
            actually file. --}}
       <div class="ctl" style="gap:10px">
-        <label class="f" style="min-width:220px"><span class="lbl">Position (what TCP files it as)</span>
-          <select name="position_id" id="seg-position">
-            @foreach ($filable as $p)
-              <option value="{{ $p->id }}">{{ $p->label }}</option>
-            @endforeach
-          </select>
-        </label>
+        {{-- THE POSITION FIELD IS GONE FROM THIS DIALOG. It was a repair path:
+               a punch recorded against a role TCP had no code for could only be
+               fixed by re-filing it, and before this dialog could do that the
+               only way out was deleting evidence of worked hours and retyping
+               them. That punch cannot exist any more — the role comes from TCP's
+               own assignment, so a punch that saved has a code that exists, and
+               a correction only ever moves the clocks. --}}
       </div>
 
       <div id="seg-hint" class="note" style="border-left:3px solid var(--line-2);padding-left:9px">—</div>
@@ -878,13 +875,6 @@
       // Nothing to keep on a punch that was never approved.
       reapprove.disabled = chip.dataset.approved !== '1';
 
-      // Preselected to what the punch already is, so saving a plain time
-      // correction cannot silently re-file it under a different role. A punch
-      // whose position is NOT offered — the stuck case — leaves the box on its
-      // first option, which is the point: it has to change to something valid.
-      const pos = document.getElementById('seg-position');
-      if (pos) { pos.value = chip.dataset.position || ''; }
-
       updateHint();
       dlg.showModal();
     });
@@ -956,6 +946,34 @@
     });
   });
 
+  // Delete, on the chip. Two separate problems, and the second is the one that
+  // bites: the button lives inside a draggable element, so pressing it is also
+  // the start of a drag gesture unless the chip is told to stand down.
+  document.querySelectorAll('.chip-del').forEach(btn => {
+    const chip = btn.closest('.chip-shift');
+
+    // draggable="false" on the button is not enough on its own — the drag still
+    // starts from the chip. Suspend it for the press, and restore it after, so a
+    // cancelled confirm leaves a chip that can still be dragged.
+    btn.addEventListener('pointerdown', () => { if (chip) chip.draggable = false; });
+
+    const restore = () => {
+      if (chip && chip.dataset.locked !== '1') chip.draggable = true;
+    };
+    btn.addEventListener('pointerup', restore);
+    btn.addEventListener('pointercancel', restore);
+    btn.addEventListener('blur', restore);
+
+    btn.addEventListener('click', ev => {
+      // A soft delete is only recoverable from the database, and for a series
+      // the default rule reaches dates nobody is looking at. Ask first.
+      if (!window.confirm(btn.dataset.confirm)) {
+        ev.preventDefault();
+        restore();
+      }
+    });
+  });
+
   document.querySelectorAll('.wk-cell').forEach(cellEl => {
     cellEl.addEventListener('dragover', ev => {
       if (!dragged) return;
@@ -1017,3 +1035,37 @@
 </script>
 @endif
 @endsection
+
+{{-- ── the open-slot position field ──────────────────────────────────────
+     The only position picker left on the console, and it applies to exactly one
+     case: a shift with nobody on it. Assign a person and their role comes from
+     TCP, so the field has nothing to say and is hidden.
+
+     The SERVER is the authority — storeShift() overrides position_id whenever an
+     employee is present, so a stale page cannot book somebody against a role TCP
+     does not have them in. This is only about not showing a field whose value
+     will be ignored. --}}
+<script>
+(function () {
+  var picker = document.querySelector('.js-open-shift-toggle');
+  var field = document.querySelector('.js-open-shift-only');
+  if (!picker || !field) return;
+
+  var select = field.querySelector('select');
+
+  function sync() {
+    // Empty value is "— open shift —", the one case with no person to inherit
+    // a role from.
+    var open = picker.value === '';
+    field.style.display = open ? '' : 'none';
+    // DISABLED, NOT JUST HIDDEN. A select hidden with CSS still submits, so with
+    // a person chosen the form used to post a position nobody could see — and
+    // the server took it whenever the profile had no answer, quietly rostering
+    // them as whatever came first in the list. Disabled, it posts nothing.
+    if (select) { select.disabled = !open; }
+  }
+
+  picker.addEventListener('change', sync);
+  sync();
+})();
+</script>

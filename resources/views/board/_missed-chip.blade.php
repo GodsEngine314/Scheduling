@@ -22,8 +22,9 @@
             .$startLocal->format('H:i').'–'.$endLocal->format('H:i')
             .($s->position ? ' as '.$s->position->label : '')
             .', and no punch was ever recorded against it.',
-        'Either TCP has hours we have not pulled, or nobody clocked in. '
-            .'Pull the week again first; if it stays empty, it needs a correction.',
+        'Either TCP has not sent the hours yet, or nobody clocked in. The board '
+            .'checks TCP by itself every few seconds — if this stays empty, it '
+            .'needs a correction.',
     ];
 @endphp
 <div class="chip-seg missed missing-in" title="{{ implode("\n", $tip) }}">
